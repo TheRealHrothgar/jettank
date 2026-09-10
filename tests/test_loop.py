@@ -129,6 +129,68 @@ check("only recent observations sent", body.count("- obs") == 8, f"count={body.c
 check("oldest observation dropped", "obs0\n" not in body)
 check("newest observation kept", "obs19" in body)
 
+# ---------- multimodal ----------
+print("\nMultimodal (frames sent to the cloud)")
+import base64 as _b64
+
+PNG_B64 = _b64.b64encode(open("testdata/scene.png", "rb").read()).decode()
+JPEG_B64 = _b64.b64encode(b"\xff\xd8\xff\xe0" + b"\x00" * 32).decode()
+
+check("png media type sniffed", CloudAgent._media_type(PNG_B64) == "image/png")
+check("jpeg media type sniffed", CloudAgent._media_type(JPEG_B64) == "image/jpeg")
+check("garbage falls back to jpeg", CloudAgent._media_type("!!!!") == "image/jpeg")
+
+cap = {}
+
+
+def mm_anthropic(method, url, payload):
+    cap["p"] = payload
+    return fake.Response(200, {"content": [{"type": "text", "text": '{"action":"approach"}'}]})
+
+
+fake.AsyncClient.handler = mm_anthropic
+a2 = CloudAgent("anthropic", "", "claude-opus-5", "k", 5.0, 256)
+asyncio.run(a2.think(["a red ball"], image_b64=PNG_B64))
+blocks = cap["p"]["messages"][0]["content"]
+check("anthropic sends a list of content blocks", isinstance(blocks, list))
+check("image block first", blocks[0]["type"] == "image")
+check("image is base64 source", blocks[0]["source"]["type"] == "base64")
+check("correct media_type forwarded", blocks[0]["source"]["media_type"] == "image/png")
+check("image data matches frame", blocks[0]["source"]["data"] == PNG_B64)
+check("text block still present", blocks[-1]["type"] == "text" and "red ball" in blocks[-1]["text"])
+
+# text-only: a single text block is the canonical Anthropic shape and is valid
+asyncio.run(a2.think(["a red ball"], image_b64=None))
+tb = cap["p"]["messages"][0]["content"]
+check("anthropic text-only sends one text block",
+      isinstance(tb, list) and len(tb) == 1 and tb[0]["type"] == "text")
+check("anthropic text-only carries no image", not any(b.get("type") == "image" for b in tb))
+
+
+def mm_openai(method, url, payload):
+    cap["p"] = payload
+    return fake.Response(200, {"choices": [{"message": {"content": '{"action":"idle"}'}}]})
+
+
+fake.AsyncClient.handler = mm_openai
+o2 = CloudAgent("openai", "https://gw", "m", "k", 5.0, 256)
+asyncio.run(o2.think(["x"], image_b64=JPEG_B64))
+uc = cap["p"]["messages"][1]["content"]
+check("openai sends content list", isinstance(uc, list))
+check("openai uses image_url data URI", uc[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+asyncio.run(o2.think(["x"], image_b64=None))
+check("openai text-only stays a plain string", isinstance(cap["p"]["messages"][1]["content"], str))
+
+# the toggle must actually gate it
+import os as _os
+from jettank import config as _cfg
+_os.environ["JETTANK_CLOUD_SEND_FRAMES"] = "false"
+check("send_frames honours 'false'", _cfg.load().cloud.send_frames is False)
+_os.environ["JETTANK_CLOUD_SEND_FRAMES"] = "true"
+check("send_frames honours 'true'", _cfg.load().cloud.send_frames is True)
+del _os.environ["JETTANK_CLOUD_SEND_FRAMES"]
+check("send_frames defaults on", _cfg.load().cloud.send_frames is True)
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", ", ".join(FAIL))

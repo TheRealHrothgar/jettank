@@ -39,6 +39,7 @@ class Loop:
         )
         self.robot = build_robot()
         self.observations: deque[str] = deque(maxlen=32)
+        self.last_image_b64: str | None = None
         self.plan: dict | None = None
         self._last_cloud = 0.0
         self._cloud_task: asyncio.Task | None = None
@@ -63,6 +64,7 @@ class Loop:
                 if text:
                     self.vlm_calls += 1
                     self.observations.append(text)
+                    self.last_image_b64 = img
                     log.info("[see] %s", text)
                     self._maybe_escalate()
             elapsed = time.monotonic() - started
@@ -82,7 +84,8 @@ class Loop:
         self._cloud_task = asyncio.create_task(self._think())
 
     async def _think(self) -> None:
-        plan = await self.cloud.think(list(self.observations))
+        frame = self.last_image_b64 if self.cfg.cloud.send_frames else None
+        plan = await self.cloud.think(list(self.observations), image_b64=frame)
         if not plan:
             return
         self.cloud_calls += 1
@@ -134,7 +137,10 @@ class Loop:
                 "(e.g. `ollama pull %s`)",
                 self.cfg.vlm.model, self.cfg.vlm.base_url, self.cfg.vlm.model,
             )
-        log.info("cloud provider=%s enabled=%s", self.cfg.cloud.provider, self.cloud.enabled)
+        log.info(
+            "cloud provider=%s enabled=%s send_frames=%s",
+            self.cfg.cloud.provider, self.cloud.enabled, self.cfg.cloud.send_frames,
+        )
         tasks = [
             asyncio.create_task(self.perceive_forever()),
             asyncio.create_task(self.status_forever()),
@@ -199,7 +205,8 @@ async def _amain(argv=None) -> int:
         text = await loop.vlm.describe(img)
         log.info("[see] %s", text)
         if text and loop.cloud.enabled:
-            log.info("[plan] %s", await loop.cloud.think([text]))
+            frame = img if cfg.cloud.send_frames else None
+            log.info("[plan] %s", await loop.cloud.think([text], image_b64=frame))
         if not static:
             loop.camera.stop()
         await loop.vlm.aclose()

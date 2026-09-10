@@ -13,6 +13,13 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _env_b(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_f(name: str, default: float) -> float:
     try:
         return float(os.environ[name])
@@ -57,6 +64,9 @@ class CloudConfig:
     # Never escalate to the cloud more often than this, regardless of events.
     min_interval_s: float = field(default_factory=lambda: _env_f("JETTANK_CLOUD_MIN_INTERVAL", 6.0))
     max_tokens: int = 512
+    # Send the camera frame itself, not just the local VLM's text description.
+    # Better fine-detail reasoning, at the cost of imagery leaving the device.
+    send_frames: bool = field(default_factory=lambda: _env_b("JETTANK_CLOUD_SEND_FRAMES", True))
 
     @property
     def api_key(self) -> str | None:

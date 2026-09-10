@@ -54,12 +54,24 @@ fighting the OOM killer.
 | `JETTANK_CLOUD_MODEL` | `claude-opus-5` | cloud model id |
 | `JETTANK_CLOUD_KEY_ENV` | `ANTHROPIC_API_KEY` | env var holding the key |
 | `JETTANK_CLOUD_MIN_INTERVAL` | `6.0` | escalation rate limit |
+| `JETTANK_CLOUD_SEND_FRAMES` | `true` | send the camera frame to the cloud model, not just text |
 
 `provider=none` runs fully local — useful before the cloud data-path question is
 settled, since camera frames leaving the device is a policy decision.
 
-Note the cloud model only ever receives **text observations** from the local
-VLM, never raw images. That keeps imagery on-device by default.
+### What the cloud model receives
+
+By default the cloud model gets **both** the local VLM's text observations and
+the current camera frame (`JETTANK_CLOUD_SEND_FRAMES=true`). Sending the frame
+measurably improves its reasoning — it picks up spatial detail the local model
+never wrote down.
+
+Set `JETTANK_CLOUD_SEND_FRAMES=false` to send text only, which keeps all imagery
+on-device. That is the right setting if camera frames leaving the robot is a
+policy problem; the loop works either way.
+
+Frames are sent as base64 with the media type sniffed from the image header —
+`image/png` or `image/jpeg` as appropriate.
 
 ## Tests
 
@@ -97,8 +109,11 @@ Any OpenAI-compatible gateway works instead:
 
 ## Status
 
-- [x] Loop, clients and config — 18/18 logic tests pass
-- [ ] Jetson reachable (blocked: `nv-oobe` first-boot wizard needs a display)
-- [ ] Local VLM pulled and benchmarked against measured free RAM
+- [x] Loop, clients and config — 35/35 logic tests pass
+- [x] Local VLM live — `qwen2.5vl:3b` real inference (~2-5 s warm on laptop CPU)
+- [x] Cloud LLM live — `claude-opus-5` over `api.anthropic.com`, plans parsed
+- [x] Full loop cycling continuously, with cloud reasoning over temporal context
+- [x] Multimodal — camera frames sent to the cloud model
+- [ ] Jetson reachable (blocked: `nv-oobe` first-boot wizard needs a power-cycle)
+- [ ] Local VLM benchmarked against measured free RAM on-device
 - [ ] Yahboom SDK identified; `NullRobot` replaced with the real driver
-- [ ] Cloud provider chosen

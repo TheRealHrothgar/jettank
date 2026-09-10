@@ -6,6 +6,7 @@ decision about Anthropic vs. an internal gateway is baked into the loop.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import httpx
@@ -14,8 +15,9 @@ log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are the high-level planner for a small tracked robot (Yahboom Jettank on a "
-    "Jetson Orin Nano). A local vision model reports what the camera sees. You decide "
-    "what the robot should do next.\n\n"
+    "Jetson Orin Nano). A local vision model reports what the camera sees, and you may "
+    "also be given the current camera frame. Trust the image over the text where they "
+    "disagree. You decide what the robot should do next.\n\n"
     "You do not control the robot directly and you are NOT a safety system - an "
     "on-board loop handles obstacle stops and arm limits and may override you.\n\n"
     "Reply with strict JSON only:\n"
@@ -58,23 +60,51 @@ class CloudAgent:
             return False
         return True
 
-    async def think(self, observations: list[str]) -> dict | None:
-        """Send recent observations, get a plan back. None on any failure."""
+    @staticmethod
+    def _media_type(image_b64: str) -> str:
+        """Sniff the format from the decoded header; Anthropic requires the real type."""
+        try:
+            head = base64.b64decode(image_b64[:16], validate=False)[:4]
+        except Exception:  # noqa: BLE001 - fall back to the camera's format
+            return "image/jpeg"
+        if head.startswith(b"\x89PNG"):
+            return "image/png"
+        if head.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if head.startswith(b"GIF8"):
+            return "image/gif"
+        if head[:4] == b"RIFF":
+            return "image/webp"
+        return "image/jpeg"
+
+    async def think(self, observations: list[str], image_b64: str | None = None) -> dict | None:
+        """Send recent observations (and optionally the frame), get a plan back."""
         if not self.enabled:
             return None
         recent = "\n".join(f"- {o}" for o in observations[-8:])
         user = f"Recent observations from the robot's camera:\n{recent}\n\nWhat should it do next?"
         try:
             if self._provider == "anthropic":
-                raw = await self._anthropic(user)
+                raw = await self._anthropic(user, image_b64)
             else:
-                raw = await self._openai_compatible(user)
+                raw = await self._openai_compatible(user, image_b64)
         except Exception as exc:  # noqa: BLE001 - cloud is best-effort by design
             log.warning("cloud call failed: %s", exc)
             return None
         return self._parse(raw)
 
-    async def _anthropic(self, user: str) -> str:
+    async def _anthropic(self, user: str, image_b64: str | None = None) -> str:
+        content: list[dict] = []
+        if image_b64:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": self._media_type(image_b64),
+                    "data": image_b64,
+                },
+            })
+        content.append({"type": "text", "text": user})
         r = await self._client.post(
             f"{self._base}/v1/messages",
             headers={
@@ -86,14 +116,22 @@ class CloudAgent:
                 "model": self._model,
                 "max_tokens": self._max_tokens,
                 "system": SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": user}],
+                "messages": [{"role": "user", "content": content}],
             },
         )
         r.raise_for_status()
         parts = r.json().get("content", [])
         return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 
-    async def _openai_compatible(self, user: str) -> str:
+    async def _openai_compatible(self, user: str, image_b64: str | None = None) -> str:
+        if image_b64:
+            url = f"data:{self._media_type(image_b64)};base64,{image_b64}"
+            user_content: object = [
+                {"type": "image_url", "image_url": {"url": url}},
+                {"type": "text", "text": user},
+            ]
+        else:
+            user_content = user
         r = await self._client.post(
             f"{self._base}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self._key}", "content-type": "application/json"},
@@ -102,7 +140,7 @@ class CloudAgent:
                 "max_tokens": self._max_tokens,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user},
+                    {"role": "user", "content": user_content},
                 ],
             },
         )
