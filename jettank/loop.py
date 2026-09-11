@@ -19,7 +19,7 @@ import time
 from collections import deque
 
 from . import config as cfg_mod
-from .camera import Camera
+from .camera import build_camera
 from .cloud import CloudAgent
 from .robot import build as build_robot
 from .vlm import LocalVLM
@@ -31,7 +31,7 @@ class Loop:
     def __init__(self, cfg, static_image_b64: str | None = None) -> None:
         self.cfg = cfg
         self.static_image_b64 = static_image_b64
-        self.camera = Camera(cfg.camera.device, cfg.camera.width, cfg.camera.height, cfg.camera.fps)
+        self.camera = build_camera(cfg.camera.device, cfg.camera.width, cfg.camera.height, cfg.camera.fps)
         self.vlm = LocalVLM(cfg.vlm.base_url, cfg.vlm.model, cfg.vlm.timeout_s, cfg.vlm.max_tokens)
         self.cloud = CloudAgent(
             cfg.cloud.provider, cfg.cloud.base_url, cfg.cloud.model,
