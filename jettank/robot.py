@@ -41,10 +41,20 @@ class NullRobot:
 
 
 def build() -> RobotDriver:
-    """Return the best available driver. Falls back to NullRobot."""
+    """Return the best available driver. Falls back to NullRobot.
+
+    The Yahboom driver starts in dry-run: it encodes and logs frames but does
+    not transmit, because the frame format is not yet confirmed against the
+    board's own SDK. Sending a wrong servo command can drive the arm into its
+    end stops. Call `arm_live()` on the driver once verified.
+    """
     try:
-        # Placeholder for the real Yahboom SDK once identified on the board.
-        raise ImportError
-    except ImportError:
-        log.warning("no Yahboom SDK found - using NullRobot (no motion)")
+        from .yahboom import YahboomRobot
+
+        robot = YahboomRobot()
+        robot.open()
+        log.info("Yahboom driver active (dry-run; call arm_live() to transmit)")
+        return robot
+    except Exception as exc:  # noqa: BLE001 - any failure must not stop perception
+        log.warning("no Yahboom board usable (%s) - using NullRobot (no motion)", exc)
         return NullRobot()
