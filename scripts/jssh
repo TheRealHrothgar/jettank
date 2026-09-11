@@ -1,0 +1,13 @@
+#!/bin/bash
+# Run a command on the Jetson over SSH.
+# WSL is NAT'd and cannot reach 169.254.0.0/16 on the host NIC, so we hop
+# through the Windows OpenSSH client via powershell.exe.
+JETSON_IP="${JETSON_IP:-169.254.215.162}"
+KEY='C:\Users\daaddison\.ssh\jetson_ed25519'
+CMD="$*"
+# base64 the command so quoting survives the PowerShell -> ssh -> bash journey
+B64=$(printf '%s' "$CMD" | base64 -w0)
+powershell.exe -NoProfile -Command "
+\$ErrorActionPreference='Continue'
+ssh -i '$KEY' -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR jetson@$JETSON_IP \"echo $B64 | base64 -d | bash -s\" 2>&1
+" 2>/dev/null | sed -e 's/\r$//'
