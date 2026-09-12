@@ -1,0 +1,6 @@
+# Stable name for the LIDAR regardless of enumeration order.
+# Yahboom shipped only the CH340 line; ours is a CP210x revision, so both
+# are listed. Without this the device is /dev/ttyUSB0 or ttyUSB1 depending
+# on what else was plugged in first.
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE:="0666", SYMLINK+="rplidar"
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE:="0666", SYMLINK+="rplidar"
