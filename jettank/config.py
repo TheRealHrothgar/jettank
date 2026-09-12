@@ -13,6 +13,13 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _env_i(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
 def _env_b(name: str, default: bool) -> bool:
     v = os.environ.get(name)
     if v is None:
@@ -30,9 +37,12 @@ def _env_f(name: str, default: float) -> float:
 @dataclass(frozen=True)
 class CameraConfig:
     device: str = field(default_factory=lambda: _env("JETTANK_CAMERA", "0"))
-    width: int = 1280
-    height: int = 720
-    fps: int = 30
+    # Resolution dominates VLM cost: prompt tokens scale with pixel count, and
+    # on an Orin Nano the prompt eval is the bottleneck, not the decode. 640x480
+    # is ample for obstacle-level scene description.
+    width: int = field(default_factory=lambda: _env_i("JETTANK_CAM_WIDTH", 640))
+    height: int = field(default_factory=lambda: _env_i("JETTANK_CAM_HEIGHT", 480))
+    fps: int = field(default_factory=lambda: _env_i("JETTANK_CAM_FPS", 30))
 
 
 @dataclass(frozen=True)

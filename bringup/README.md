@@ -83,8 +83,14 @@ ln -sf /usr/lib/systemd/system/multi-user.target \
                       /mnt/etc/systemd/system/default.target
 chroot /mnt /usr/sbin/useradd -m -s /bin/bash jetson
 echo 'jetson:jetson' | chroot /mnt /usr/sbin/chpasswd
-chroot /mnt /usr/sbin/usermod -aG sudo,video,audio,dialout,plugdev jetson
+chroot /mnt /usr/sbin/usermod -aG sudo,video,audio,dialout,plugdev,render jetson
 ```
+
+**`render` is not optional.** CUDA opens `/dev/dri/renderD128`, which is owned by
+group `render`. Omit it and `cuInit` returns **801 CUDA_ERROR_NOT_SUPPORTED** with
+no useful message — the only way to see it is `strace`:
+`openat("/dev/dri/renderD128", O_RDWR) = -1 EACCES`. The OOBE wizard adds this
+group for you; if you bypass OOBE you must add it yourself.
 
 `multi-user.target` as default also keeps it headless, which matters: the
 desktop costs ~1 GB of the 8 GB shared between CPU and GPU.
@@ -138,3 +144,63 @@ I2C     buses 0,1,2,4,5,7 — only on-module EEPROMs; no expansion board
   not the Jetson supply.
 * No internet on a link-local-only link, so packages must be staged from the
   host over `scp`, or the board plugged into a router.
+
+## 7. Wi-Fi (Intel 8265) — four stacked problems
+
+NVIDIA's kernel ships **no Intel wireless driver** (`drivers/net/wireless/` has ath,
+broadcom, marvell, mediatek, rsi, ti — no intel), so `nmcli` reports `WIFI-HW missing`.
+
+```sh
+sudo apt-get install dkms build-essential linux-firmware-intel-wireless backport-iwlwifi-dkms
+# the backport refuses to build: OBSOLETE_BY="6.7.0" assumes 6.8 has it in-tree. It does not.
+sudo sed -i '/^OBSOLETE_BY=/d' /var/lib/dkms/backport-iwlwifi/11510/source/dkms.conf
+sudo dkms remove -m backport-iwlwifi -v 11510 --all
+sudo dkms add    -m backport-iwlwifi -v 11510
+sudo dkms build  -m backport-iwlwifi -v 11510 -k "$(uname -r)"
+sudo dkms install -m backport-iwlwifi -v 11510 -k "$(uname -r)" --force
+
+# the backport ships its own cfg80211/mac80211; unload the in-tree ones or you get
+# "iwlwifi: disagrees about version of symbol reg_query_regdb_wmm"
+sudo modprobe -r iwlwifi mac80211 cfg80211
+
+# firmware is shipped .zst-compressed and this kernel cannot decompress firmware
+for f in /lib/firmware/iwlwifi-8265-*.ucode.zst; do sudo zstd -d -f "$f" -o "${f%.zst}"; done
+sudo modprobe iwlwifi
+echo iwlwifi | sudo tee /etc/modules-load.d/iwlwifi.conf
+```
+
+## 8. GPU / CUDA
+
+**Symptom:** `cuInit` returns `801 CUDA_ERROR_NOT_SUPPORTED`, 0 devices.
+
+**Cause 1 — QSPI firmware older than the OS.** Check `sudo nvbootctrl dump-slots-info`
+against `dpkg -l nvidia-l4t-bootloader`. If QSPI < OS, DCE fails to bootstrap
+(`DCE ucode abort occurred`) and `RmInitAdapter` dies.
+
+```sh
+# REMOVE THE INSTALLER microSD FIRST - two ESPs means fwupd stages to the wrong one
+sudo fwupdmgr get-devices        # note the "System Firmware" Device ID
+sudo fwupdtool install-blob /opt/ota_package/t23x/TEGRA_BL_3767_super.Cap <device-id>
+ls -la /boot/efi/EFI/UpdateCapsule/   # MUST be non-empty before you reboot
+sudo reboot
+```
+`dpkg-reconfigure nvidia-l4t-bootloader` will not do this: its ISO branch refuses to
+update QSPI below 38.0.0. The fwupd branch has no such gate.
+
+**Cause 2 — the user is not in `render`.** CUDA opens `/dev/dri/renderD128`, group
+`render`. Without it you get 801 and no diagnostic; only `strace` shows
+`openat("/dev/dri/renderD128", O_RDWR) = -1 EACCES`.
+
+```sh
+sudo usermod -aG render <user>   # then start a NEW session
+```
+
+**Also:** the ISO installs only the base OS. CUDA is a second pass —
+`sudo apt-get install nvidia-jetpack-runtime`.
+
+**Do not try to switch nvgpu -> openrm.** `/etc/systemd/nv-load-display-modules-choose-variant.sh`
+selects `nvgpu-l4t` for any `tegra23` chip by design, and `nv-load-gpu-libs.service`
+rewrites `ld.so.conf.d` and the `libcuda` symlinks every boot.
+
+**Performance:** prompt tokens scale with camera resolution and dominate cost.
+1280x720 gave 1278 prompt tokens (~73 s); **640x480 cut a full inference to ~9 s.**

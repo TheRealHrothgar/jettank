@@ -21,7 +21,7 @@ rm -f /etc/systemd/system/multi-user.target.wants/nv-oobe.service || true
 # Create the account the wizard would have created.
 if ! id "$USERNAME" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$USERNAME"
-  usermod -aG sudo,video,audio,dialout,i2c,gpio "$USERNAME" || true
+  usermod -aG sudo,video,audio,dialout,plugdev,render,i2c,gpio "$USERNAME" || true
 fi
 echo "${USERNAME}:${PASSWORD}" | chpasswd
 
