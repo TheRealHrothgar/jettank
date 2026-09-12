@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import logging
 import os
 import re
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Any, Callable
 
@@ -46,6 +48,44 @@ _ABBREV = [
 ]
 
 
+# Source code must never reach the synthesiser. Stripping its punctuation does
+# not help - what is left is a stream of identifiers ("async def run robot
+# params") which is exactly the gibberish this was chasing. Code is removed
+# outright and replaced with a mention, because the only sane spoken form of a
+# function body is a description of it.
+_FENCED = re.compile(r"```[\w+-]*\n?.*?(?:```|$)", re.S)
+_INDENTED_BLOCK = re.compile(r"(?:^[ \t]{4,}\S.*(?:\n|$)){2,}", re.M)
+_CODE_LINE = re.compile(
+    r"^\s*(?:from|import|def|async\s+def|class|return|await|for|while|if|elif|"
+    r"else|try|except|finally|with|yield|raise|assert|lambda|@\w+)\b.*$|"
+    r"^\s*[\w.\[\]\'\"]+\s*=\s*.+$|"      # assignment
+    r"^\s*[\w.]+\(.*\)\s*:?\s*$|"            # bare call
+    r"^\s*[)\]}>][,;:]?\s*$",                  # closing bracket line
+    re.M)
+
+
+def strip_code(text: str) -> tuple[str, bool]:
+    """Remove code from text destined for speech. Returns (text, had_code)."""
+    if not text:
+        return "", False
+    original = text
+    t = _FENCED.sub(" ", text)
+    t = _INDENTED_BLOCK.sub(" ", t)
+    t = _CODE_LINE.sub(" ", t)
+    had = len(t) < len(original) - 8
+    # A line that is mostly punctuation and identifiers is code we missed.
+    kept = []
+    for line in t.splitlines():
+        stripped = line.strip()
+        if stripped and len(stripped) > 8:
+            symbols = sum(c in "(){}[]<>=+*/\\|&^~;:_" for c in stripped)
+            if symbols / len(stripped) > 0.18:
+                had = True
+                continue
+        kept.append(line)
+    return " ".join(" ".join(kept).split()), had
+
+
 def for_speech(text: str, max_chars: int = 600) -> str:
     """Turn machine text into something worth hearing.
 
@@ -56,7 +96,12 @@ def for_speech(text: str, max_chars: int = 600) -> str:
     """
     if not text:
         return ""
-    t = _URL.sub("a link", str(text))
+    t, had_code = strip_code(str(text))
+    if had_code and not t.strip():
+        return "I have written the code."
+    if had_code:
+        t = t.rstrip(" .,:;") + ". The code itself is saved, I will not read it out."
+    t = _URL.sub("a link", t)
     # Arrows first: "=>" must not become "equals >" and then "equals equals".
     for arrow in ("=>", "->", "-->", "<-", "→"):
         t = t.replace(arrow, " then ")
@@ -90,54 +135,54 @@ def for_speech(text: str, max_chars: int = 600) -> str:
     return t
 
 
-# Sentences longer than this have nowhere to breathe. Piper paces on
-# punctuation, so a 40-word clause chain is delivered as one unbroken run -
-# which is what "unpaced transliteration" sounds like.
-_LONG_RUN = 18
+# Only genuinely unpunctuated runs get broken up. An earlier version split at
+# commas and conjunctions to "add pacing", which wrecked well-formed prose:
+# "...a lamp on the right. casting light onto a window." - a fragment starting
+# mid-clause on a lowercase word. Spoken, that is far worse than a long
+# sentence. Piper already paces on commas and full stops; the job here is only
+# to rescue text that has no punctuation for it to work with.
+_RUNAWAY_WORDS = 34
 
 
 def _pace(text: str) -> str:
-    """Give the synthesiser somewhere to breathe.
+    """Break up only sentences that give the synthesiser nothing to work with.
 
-    Breaks over-long sentences at natural clause joints into separate
-    sentences, so Piper emits them as distinct chunks with a real pause
-    between, rather than one continuous run.
+    A sentence with internal commas is left completely alone - Piper handles
+    it. A long sentence with no internal punctuation at all is split, and the
+    new sentence is capitalised so it does not sound like a fragment.
     """
     out: list[str] = []
     for sentence in re.split(r"(?<=[.!?])\s+", text):
         words = sentence.split()
-        if len(words) <= _LONG_RUN:
+        if len(words) <= _RUNAWAY_WORDS or "," in sentence:
             out.append(sentence)
             continue
-        # Prefer breaking where the speaker would: after a comma, or before a
-        # conjunction. Falls back to a hard split so nothing runs away.
-        chunk: list[str] = []
+        # No commas and very long: insert breaks before a conjunction, and
+        # capitalise so each piece reads as its own sentence.
+        piece: list[str] = []
         for w in words:
-            # Break *before* a conjunction, not after it - closing a sentence
-            # on "and." is worse than not breaking at all.
-            if len(chunk) >= 8 and w.lower() in ("and", "but", "then", "so"):
-                out.append(" ".join(chunk).rstrip(",") + ".")
-                chunk = [w]
+            if len(piece) >= 12 and w.lower() in ("and", "but", "then", "so", "while"):
+                out.append(_as_sentence(piece))
+                piece = [w]
                 continue
-            chunk.append(w)
-            if len(chunk) >= 8 and w.endswith(","):
-                out.append(" ".join(chunk).rstrip(",") + ".")
-                chunk = []
-            elif len(chunk) >= _LONG_RUN + 6:
-                out.append(" ".join(chunk).rstrip(",") + ".")
-                chunk = []
-        if chunk:
-            # A trailing fragment of one or two words belongs to the previous
-            # sentence, not alone.
-            tail = " ".join(chunk)
-            if len(chunk) <= 2 and out:
-                out[-1] = out[-1].rstrip(".") + " " + tail
+            piece.append(w)
+        if piece:
+            if len(piece) <= 3 and out:
+                out[-1] = out[-1].rstrip(".") + " " + " ".join(piece)
             else:
-                out.append(tail)
+                out.append(_as_sentence(piece))
     paced = " ".join(p for p in out if p.strip(" ."))
     if paced and paced[-1] not in ".!?":
         paced += "."
     return paced
+
+
+def _as_sentence(words: list[str]) -> str:
+    s = " ".join(words).strip(" ,")
+    if not s:
+        return ""
+    s = s[0].upper() + s[1:]
+    return s if s[-1] in ".!?" else s + "."
 
 
 def _run_coro(coro):
@@ -564,10 +609,10 @@ class ToolBox:
         if self._writer is None or not self._writer.available:
             return {"ok": False, "error": "code generation needs a cloud provider configured"}
         out = await self._writer.write(name, request)
-        # The source can be long and the model already knows what it asked for;
-        # return a preview so the tool result stays readable.
-        if out.get("ok") and "source" in out:
-            out["preview"] = "\n".join(out.pop("source").splitlines()[:20])
+        # Deliberately NOT returning the source. Anything in a tool result
+        # tends to come back in the spoken reply, and source read aloud is
+        # gibberish. read_behavior exists for when it is actually wanted.
+        out.pop("source", None)
         return out
 
     async def _t_run_behavior(self, name: str, params: dict | None = None) -> dict:
@@ -584,7 +629,10 @@ class ToolBox:
         if self._behaviors is None:
             return {"ok": False, "error": "behaviours are not available on this robot"}
         src = self._behaviors.store.read(name)
-        return ({"ok": True, "name": name, "source": src} if src is not None
+        return ({"ok": True, "name": name, "source": src,
+                 "note": "This is source code. Do not read it aloud - describe "
+                         "what it does in plain words instead."}
+                if src is not None
                 else {"ok": False, "error": f"no behaviour called {name!r}"})
 
     def _t_set_config(self, key: str, value: str) -> dict:
@@ -653,14 +701,14 @@ class Speaker:
         found = sorted(vdir.glob("*.onnx")) if vdir.is_dir() else []
         return str(found[0]) if found else None
 
-    # Pacing. The failure this fixes is not bad words, it is bad delivery:
-    # Piper renders a whole utterance as one continuous run, so clause after
-    # clause arrives with no pause and the listener has nothing to parse
-    # against. Slowing very slightly and inserting real silence at sentence
-    # boundaries is the difference between a transliteration and speech.
-    RATE = float(os.environ.get("JETTANK_TTS_RATE", "1.06"))          # >1 slower
-    SENTENCE_GAP_MS = int(os.environ.get("JETTANK_TTS_GAP_MS", "260"))
-    CLAUSE_GAP_MS = int(os.environ.get("JETTANK_TTS_CLAUSE_GAP_MS", "90"))
+    # Piper's own defaults, deliberately. An earlier version slowed the rate
+    # and injected silence between sentence chunks to "improve pacing"; a
+    # side-by-side listening test on the robot showed plain default Piper was
+    # clearly the most intelligible, and both adjustments made it worse. The
+    # model's own prosody already handles commas and full stops. Left as knobs
+    # for tuning, but do not change the defaults without listening first.
+    RATE = float(os.environ.get("JETTANK_TTS_RATE", "1.0"))          # >1 slower
+    SENTENCE_GAP_MS = int(os.environ.get("JETTANK_TTS_GAP_MS", "0"))
 
     def _syn_config(self):
         """Piper's own gain stage.
@@ -705,48 +753,57 @@ class Speaker:
             return self._voice
 
     def _speak_piper(self, text: str) -> dict:
-        """Synthesise and play as chunks arrive, so speech starts immediately."""
+        """Synthesise the whole utterance, then play it as a single WAV.
+
+        This used to stream raw PCM into `aplay -t raw -` chunk by chunk, to
+        start speaking sooner. It garbled the speech: fed raw, aplay uses tiny
+        default period and buffer sizes, and writing in large irregular bursts
+        underruns it - which sounds like slurred, mispaced nonsense rather than
+        an obvious dropout, so it was easy to mistake for a text problem.
+
+        Every side-by-side listening test that sounded correct was playing a
+        complete WAV. So that is what we do. Synthesis runs at roughly 0.15x
+        realtime on this board - about 0.6s for a four-second utterance - so
+        the latency this costs is small and the intelligibility is worth far
+        more than the head start.
+        """
         voice = self._load_piper()
-        proc = None
-        played = 0
         syn = self._syn_config()
-        rate = 22050
-        try:
-            for chunk in (voice.synthesize(text, syn) if syn
-                          else voice.synthesize(text)):
-                pcm = getattr(chunk, "audio_int16_bytes", None)
-                if pcm is None:  # older piper returned raw arrays
-                    pcm = bytes(chunk.audio_int16_array)
-                if proc is None:
-                    rate = getattr(chunk, "sample_rate", 22050)
-                    proc = subprocess.Popen(
-                        ["aplay", "-q", "-D", self._device, "-f", "S16_LE",
-                         "-r", str(rate),
-                         "-c", str(getattr(chunk, "sample_channels", 1)), "-t", "raw", "-"],
-                        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                else:
-                    # Piper yields one chunk per sentence, so the gap between
-                    # chunks is exactly where a speaker would draw breath.
-                    pcm = self._silence(rate, self.SENTENCE_GAP_MS) + pcm
-                try:
-                    proc.stdin.write(pcm)
-                except BrokenPipeError:
-                    # aplay exited early - almost always the ALSA device being
-                    # held by another process. Report it; do not crash.
-                    return {"ok": False, "spoken_text": text,
-                            "error": f"audio device {self._device} unavailable "
-                                     f"(is something else using it?)"}
-                played += len(pcm)
-        finally:
-            if proc is not None:
-                with contextlib.suppress(BrokenPipeError, OSError):
-                    proc.stdin.close()
-                proc.wait(timeout=120)
-        if not played:
+        chunks = list(voice.synthesize(text, syn) if syn else voice.synthesize(text))
+        if not chunks:
             return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
-        return {"ok": True, "spoken_text": text}
+
+        rate = getattr(chunks[0], "sample_rate", 22050)
+        channels = getattr(chunks[0], "sample_channels", 1)
+        gap = (self._silence(rate, self.SENTENCE_GAP_MS)
+               if self.SENTENCE_GAP_MS > 0 else b"")
+        pcm = gap.join(self._pcm_of(c) for c in chunks)
+        if not pcm:
+            return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
+
+        wav = io.BytesIO()
+        with wave.open(wav, "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(pcm)
+        try:
+            subprocess.run(["aplay", "-q", "-D", self._device], input=wav.getvalue(),
+                           timeout=max(30.0, len(pcm) / 2 / rate + 15),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "playback timed out", "spoken_text": text}
+        except FileNotFoundError:
+            return {"ok": False, "error": "aplay not installed", "spoken_text": text}
+        return {"ok": True, "spoken_text": text,
+                "duration_s": round(len(pcm) / 2 / rate, 2)}
+
+    @staticmethod
+    def _pcm_of(chunk) -> bytes:
+        pcm = getattr(chunk, "audio_int16_bytes", None)
+        if pcm is None:
+            pcm = bytes(chunk.audio_int16_array)
+        return pcm
 
     def _render(self, text: str) -> bytes:
         """WAV bytes from the fallback engine."""

@@ -358,6 +358,7 @@ check("empty buffer is safe", _rms(b"") == 0.0)
 # ---------- utterance segmentation keeps the wake word ----------
 print("\nPre-roll (wake word must survive the gate)")
 import io  # noqa: E402
+import re  # noqa: E402
 from jettank.audio import CHUNK_BYTES, VoiceListener  # noqa: E402
 
 
@@ -475,7 +476,52 @@ check("plain prose is left alone", for_speech("I see a wall.") == "I see a wall.
 check("punctuation-only yields nothing", for_speech("  ;;; ") == "")
 check("empty input is safe", for_speech("") == "")
 check("long text is cut at a sentence", for_speech("A. " * 400).endswith("."))
+
+# Regression: pacing once split well-formed prose at commas and conjunctions,
+# producing fragments like "...on the right. casting light onto a window."
+# A fragment starting mid-clause on a lowercase word is the actual gibberish -
+# worse spoken than the long sentence it was trying to fix.
+prose = ("I saw a dark room with a small table lamp on the right, casting light onto "
+         "a window. There was a television in the background, emitting bright light, "
+         "and a lamp with a twisted base.")
+check("well-formed prose is passed through untouched", for_speech(prose) == prose,
+      for_speech(prose))
+check("no lowercase sentence fragments are created",
+      not re.search(r"\.\s+[a-z]", for_speech(prose)), for_speech(prose))
+check("a sentence with commas is never split",
+      for_speech("I went left, then right, then stopped, and waited a while, and looked.")
+      .count(".") == 1)
+check("an unpunctuated runaway still gets broken up",
+      for_speech(" ".join(["word"] * 60)).count(".") >= 1)
+check("splits are capitalised, not fragments",
+      not re.search(r"\.\s+[a-z]", for_speech(
+          "I went forward then I turned left then I saw a wall and I stopped and I "
+          "waited a while and then nothing happened so I gave up and returned home "
+          "again after that")))
 check("long text respects the cap", len(for_speech("word " * 500)) <= 601)
+
+# The actual cause of the gibberish: Hank read his own generated Python aloud.
+# Stripping punctuation is not enough - what remains is a stream of
+# identifiers, which is what "async def run robot params" sounds like.
+from jettank.tools import strip_code  # noqa: E402
+
+fenced = "Here it is:\n```python\nasync def run(robot, **p):\n    await robot.look(0, 0)\n```\nDone."
+out = for_speech(fenced)
+check("fenced code never reaches speech", "def" not in out and "robot" not in out, out)
+check("prose around the code survives", "Here it is" in out, out)
+check("listener is told code exists", "code" in out.lower(), out)
+
+check("import lines are dropped", "import" not in for_speech("import os\nI am ready."))
+check("assignments are dropped", "=" not in for_speech("x = compute(3)\nI am ready."))
+check("symbol-dense lines are dropped",
+      "foo" not in for_speech("foo(a[0], b={'k': 1})\nAll done here."),
+      for_speech("foo(a[0], b={'k': 1})\nAll done here."))
+check("code-only input still says something",
+      for_speech("```python\nx = 1\n```").strip() != "")
+check("ordinary prose is untouched by the code stripper",
+      strip_code("I swept the camera and saw a lamp.")[1] is False)
+check("prose mentioning code is not mangled",
+      "wrote the code" in for_speech("I wrote the code you asked for."))
 
 
 class SilentSpeaker:

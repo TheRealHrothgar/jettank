@@ -1,0 +1,22 @@
+[Unit]
+Description=Ollama (local VLM and narrator models for Hank)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+# Installed under the user's home rather than /usr/local - no root was needed
+# to set it up, and keeping it there means an upgrade does not require sudo.
+Environment="HOME=/home/jetson"
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+# Keep models resident. Hank's narrator is called once per utterance; paying a
+# cold load each time is what made the first composition time out.
+Environment="OLLAMA_KEEP_ALIVE=30m"
+ExecStart=/home/jetson/.local/ollama/bin/ollama serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,48 @@
+[Unit]
+Description=Hank the Tank - voice and console command and control
+# Ollama holds the local vision and narrator models. Hank starts anyway if it
+# is down (perception degrades, speech falls back), so this is Wants, not
+# Requires - a robot that refuses to boot because a model server is missing is
+# less useful than one that boots and says so.
+After=network-online.target ollama.service sound.target
+Wants=network-online.target ollama.service
+
+[Service]
+Type=simple
+User=jetson
+# `docker` is needed to run generated behaviours in the sandbox; `audio` for
+# the USB speakerphone; `render` for CUDA (/dev/dri/renderD128) - omitting
+# render is what made cuInit return 801 with no useful diagnostic.
+SupplementaryGroups=audio docker render video dialout
+
+WorkingDirectory=/home/jetson/jettank
+Environment="HOME=/home/jetson"
+Environment="PATH=/home/jetson/.local/ollama/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="JETTANK_VOICE=1"
+Environment="JETTANK_CONSOLE=1"
+# Credentials live outside the repo and outside this unit. Mode 600, owned by
+# jetson; systemd reads it as that user.
+EnvironmentFile=/home/jetson/.jettank.env
+
+ExecStart=/home/jetson/jettank/.venv/bin/python3 -m jettank.loop
+
+Restart=always
+RestartSec=10
+# If it crash-loops, stop rather than thrash the audio device and the API.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Motion is gated in software regardless, but a service that cannot write
+# outside its own state has one less way to surprise anyone.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=false
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hank
+
+[Install]
+WantedBy=multi-user.target
