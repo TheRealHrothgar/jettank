@@ -55,6 +55,12 @@ class VLMConfig:
     interval_s: float = field(default_factory=lambda: _env_f("JETTANK_VLM_INTERVAL", 1.5))
     timeout_s: float = field(default_factory=lambda: _env_f("JETTANK_VLM_TIMEOUT", 20.0))
     max_tokens: int = 128
+    # A small text-only model that turns structured findings and machine text
+    # into spoken English. Local and cheap, so it can sit in front of every
+    # utterance without cloud latency or spend.
+    narrator_model: str = field(
+        default_factory=lambda: _env("JETTANK_NARRATOR_MODEL", "qwen2.5:1.5b"))
+    narrator: bool = field(default_factory=lambda: _env_b("JETTANK_NARRATOR", True))
 
 
 @dataclass(frozen=True)
@@ -73,7 +79,16 @@ class CloudConfig:
     timeout_s: float = field(default_factory=lambda: _env_f("JETTANK_CLOUD_TIMEOUT", 45.0))
     # Never escalate to the cloud more often than this, regardless of events.
     min_interval_s: float = field(default_factory=lambda: _env_f("JETTANK_CLOUD_MIN_INTERVAL", 6.0))
+    # The planner only emits a small JSON object, so it stays cheap.
     max_tokens: int = 512
+    # The agent path is different: a single tool call can carry a long
+    # natural-language code-generation request, and truncation there arrives
+    # as a *valid-looking* tool_use block with fields silently missing.
+    agent_max_tokens: int = field(
+        default_factory=lambda: _env_i("JETTANK_AGENT_MAX_TOKENS", 8192))
+    # Generated code needs room for a whole module.
+    codegen_max_tokens: int = field(
+        default_factory=lambda: _env_i("JETTANK_CODEGEN_MAX_TOKENS", 8192))
     # Send the camera frame itself, not just the local VLM's text description.
     # Better fine-detail reasoning, at the cost of imagery leaving the device.
     send_frames: bool = field(default_factory=lambda: _env_b("JETTANK_CLOUD_SEND_FRAMES", True))

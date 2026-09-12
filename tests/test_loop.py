@@ -451,6 +451,53 @@ check("speech after the window closes is ignored",
 check("cold chatter is never acted on",
       conversation([("so anyway I told him", 0), ("and then we left", 1)]) == [])
 
+# ---------- speech normalisation ----------
+print("\nSpeech normalisation (TTS reads punctuation aloud)")
+from jettank.tools import for_speech  # noqa: E402
+
+# The exact string Hank spoke as gibberish, from a live run.
+bad = "Room scan - -60 deg: I see a dark room; ahead: I see a dark room; 60 deg: I see"
+out = for_speech(bad)
+check("no stray colons survive", ":" not in out, out)
+check("no semicolons survive", ";" not in out, out)
+check("negative numbers are spoken", "minus 60" in out, out)
+check("'deg' is expanded", "degrees" in out and "deg:" not in out, out)
+check("ends as a sentence", out.endswith("."), out)
+
+check("markdown is stripped", "*" not in for_speech("**bold** and `code`"))
+check("brackets are stripped", "[" not in for_speech("see [docs] (here)"))
+check("urls are not spelled out", for_speech("go to https://a.b/c now") == "go to a link now.")
+check("arrows become words", "then" in for_speech("status -> ok") and ">" not in for_speech("status -> ok"))
+check("=> does not double up", "equals equals" not in for_speech("a => b"))
+check("percent is spoken", "percent" in for_speech("80% done"))
+check("fractions are spoken", "3 of 5" in for_speech("3/5 frames"))
+check("plain prose is left alone", for_speech("I see a wall.") == "I see a wall.")
+check("punctuation-only yields nothing", for_speech("  ;;; ") == "")
+check("empty input is safe", for_speech("") == "")
+check("long text is cut at a sentence", for_speech("A. " * 400).endswith("."))
+check("long text respects the cap", len(for_speech("word " * 500)) <= 601)
+
+
+class SilentSpeaker:
+    """Speaker with no engine - exercises say() without touching audio."""
+    def __init__(self):
+        from jettank.tools import Speaker
+        self._s = Speaker.__new__(Speaker)
+        self._s._engine = None
+        self._s._device = "null"
+        self._s._piper_voice = None
+        self._s._narrator = None
+
+    def say(self, t):
+        from jettank.tools import Speaker
+        return Speaker.say(self._s, t)
+
+
+sp = SilentSpeaker()
+check("say() refuses unspeakable text", sp.say(";;;")["ok"] is False)
+check("say() normalises before speaking",
+      ":" not in sp.say("pan: -40 deg")["spoken_text"], sp.say("pan: -40 deg")["spoken_text"])
+
 # ---------- console ----------
 print("\nConsole")
 from jettank.console import Console  # noqa: E402

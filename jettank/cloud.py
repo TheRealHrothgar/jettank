@@ -122,11 +122,17 @@ class CloudAgent:
         return self._parse(raw)
 
     async def _messages(self, messages: list[dict], tools: list[dict] | None = None,
-                        system: str | None = None) -> dict | None:
-        """Raw Messages API call returning the parsed response, or None on failure."""
+                        system: str | None = None,
+                        max_tokens: int | None = None) -> dict | None:
+        """Raw Messages API call returning the parsed response, or None on failure.
+
+        `max_tokens` is per-call because the budgets differ by an order of
+        magnitude: the planner emits a small JSON object, while an agent turn
+        may carry a long code-generation request in a single tool call.
+        """
         body: dict = {
             "model": self._model,
-            "max_tokens": self._max_tokens,
+            "max_tokens": max_tokens or self._max_tokens,
             "system": system or SYSTEM_PROMPT,
             "messages": messages,
         }
@@ -141,7 +147,16 @@ class CloudAgent:
                 json=body,
             )
             r.raise_for_status()
-            return r.json()
+            reply = r.json()
+            # A response cut off at max_tokens mid-tool-call arrives looking
+            # valid, just with arguments missing - which reads downstream as
+            # "the model forgot an argument" and gets retried forever. Say so.
+            if reply.get("stop_reason") == "max_tokens":
+                log.warning("cloud reply hit max_tokens (%d) and was truncated; "
+                            "any tool call in it is incomplete",
+                            body["max_tokens"])
+                reply["_truncated"] = True
+            return reply
         except Exception as exc:  # noqa: BLE001 - cloud is best-effort
             log.warning("cloud messages call failed: %s", exc)
             return None
@@ -235,7 +250,11 @@ AGENT_SYSTEM_PROMPT = (
     "quiet, and can refuse motion outright. If a drive call is refused because motion is "
     "disabled, accept it and say so - do not retry in a loop.\n\n"
     "Be useful and concrete. Prefer looking before moving. When enrolling a face, tell the person "
-    "what to do, capture, then confirm. Keep spoken output short and natural - it is read aloud.\n\n"
+    "what to do, capture, then confirm.\n\n"
+    "EVERYTHING YOU SAY IS READ ALOUD by a speech synthesiser. Write for the ear: "
+    "complete sentences, no markdown, no bullet points, no code, no symbols, no "
+    "field:value pairs. Say 'about forty degrees to my left' rather than 'pan=-40'. "
+    "Keep it to a couple of sentences unless asked for more.\n\n"
     "Call get_status first if you are unsure of your own state.\n\n"
     "You belong to Caelan and his brother Brayden, who built you."
 )
@@ -248,10 +267,21 @@ class AgentSession:
     simple one-shot call; this is the slower, interactive path.
     """
 
-    def __init__(self, agent: "CloudAgent", toolbox, max_turns: int = 8) -> None:
+    def __init__(self, agent: "CloudAgent", toolbox, max_turns: int = 8,
+                 max_tokens: int = 8192, system_facts: str = "") -> None:
         self._agent = agent
         self._tools = toolbox
         self._max_turns = max_turns
+        self._max_tokens = max_tokens
+        # Gathered from the running machine at startup rather than hardcoded,
+        # so it cannot claim a capability that is no longer installed.
+        self._system_facts = system_facts
+
+    @property
+    def system_prompt(self) -> str:
+        if not self._system_facts:
+            return AGENT_SYSTEM_PROMPT
+        return f"{AGENT_SYSTEM_PROMPT}\n\n{self._system_facts}"
         self.transcript: list[dict] = []
 
     async def run(self, instruction: str, image_b64: str | None = None) -> dict:
@@ -273,9 +303,16 @@ class AgentSession:
         used: list[str] = []
         for turn in range(self._max_turns):
             reply = await self._agent._messages(messages, tools=TOOL_SCHEMAS_REF[0],
-                                                system=AGENT_SYSTEM_PROMPT)
+                                                system=self.system_prompt,
+                                                max_tokens=self._max_tokens)
             if reply is None:
                 return {"ok": False, "error": "cloud call failed", "tools_used": used}
+            if reply.get("_truncated"):
+                # Retrying a truncated tool call just truncates again.
+                return {"ok": False, "tools_used": used,
+                        "error": f"the reply was cut off at {self._max_tokens} tokens, "
+                                 f"so the tool call was incomplete. Raise "
+                                 f"JETTANK_AGENT_MAX_TOKENS."}
 
             blocks = reply.get("content", [])
             messages.append({"role": "assistant", "content": blocks})
@@ -289,7 +326,10 @@ class AgentSession:
             for call in calls:
                 name, args = call.get("name", ""), call.get("input", {}) or {}
                 log.info("[agent] tool %s(%s)", name, args)
-                out = self._tools.dispatch(name, args)
+                if hasattr(self._tools, "dispatch_async"):
+                    out = await self._tools.dispatch_async(name, args)
+                else:
+                    out = self._tools.dispatch(name, args)
                 used.append(name)
                 # Images come back as a real image block so the model can look at them.
                 if name == "capture_image" and out.get("ok") and out.get("image_b64"):

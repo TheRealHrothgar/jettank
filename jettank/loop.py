@@ -15,15 +15,21 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections import deque
 
 from . import config as cfg_mod
 from .audio import Transcriber, VoiceListener, match_wake_word
 from .camera import build_camera
+from .codegen import BehaviorRunner, BehaviorStore, BehaviorWriter
 from .console import Console
+from .sandbox import Sandbox, docker_available
+from .skills import SkillStore
+from .sysinfo import collect as collect_sysinfo, describe as describe_sysinfo
 from .cloud import AgentSession, CloudAgent, register_tools
 from .faces import FaceEngine
+from .narrator import Narrator
 from .robot import build as build_robot
 from .safety import MotionGuard
 from .tools import TOOL_SCHEMAS, Speaker, ToolBox
@@ -49,10 +55,37 @@ class Loop:
         # action and is deliberately not reachable as a tool.
         self.guard = MotionGuard(self.robot, enabled=False)
         self.faces = FaceEngine()
-        self.speaker = Speaker()
-        self.toolbox = ToolBox(self, self.guard, self.camera, self.faces, self.speaker)
+        self.narrator = Narrator(cfg.vlm.base_url, cfg.vlm.narrator_model,
+                                 enabled=cfg.vlm.narrator)
+        self.speaker = Speaker(narrator=self.narrator)
+        # Off the critical path, same reasoning as the TTS voice preload.
+        threading.Thread(target=self.narrator.warm, name="narrator-warm",
+                         daemon=True).start()
+        self.skills = SkillStore()
+
+        # Code generation happens in the cloud (Anthropic Messages API); the
+        # resulting code runs in a Docker container that has no network, no
+        # devices, and reaches the robot only through a guard-gated socket.
+        # If Docker is missing we keep the writer but refuse to run, rather
+        # than quietly executing generated code in this process.
+        self.behavior_store = BehaviorStore()
+        self.writer = BehaviorWriter(self.cloud, self.behavior_store,
+                                     max_tokens=cfg.cloud.codegen_max_tokens)
+        self.sandbox = None
+        if docker_available():
+            self.sandbox = Sandbox(
+                lambda t, a: self.toolbox.dispatch(t, a),
+                describe=self._describe_now,
+            )
+        else:
+            log.warning("docker not available - generated behaviours cannot be run")
+        self.behaviors = BehaviorRunner(self.behavior_store, self.sandbox,
+                                        narrator=self.narrator)
+
+        self.toolbox = ToolBox(self, self.guard, self.camera, self.faces,
+                               self.speaker, skills=self.skills,
+                               writer=self.writer, behaviors=self.behaviors)
         register_tools(TOOL_SCHEMAS)
-        self.agent = AgentSession(self.cloud, self.toolbox)
 
         # Config objects are frozen - they record how we booted. Settings the
         # agent may retune at runtime live here instead.
@@ -73,6 +106,13 @@ class Loop:
         self.console: Console | None = None
         if cfg.console.enabled:
             self.console = Console(self, cfg.console.host, cfg.console.port)
+
+        # Built last, on purpose: the system facts describe voice, the console
+        # and the sandbox, so they must all exist before the snapshot is taken.
+        self.system_facts = describe_sysinfo(collect_sysinfo(self))
+        self.agent = AgentSession(self.cloud, self.toolbox,
+                                  max_tokens=cfg.cloud.agent_max_tokens,
+                                  system_facts=self.system_facts)
 
         self.transcript: deque[dict] = deque(maxlen=32)
         self.observations: deque[str] = deque(maxlen=32)
@@ -163,6 +203,16 @@ class Loop:
             self.robot.gripper(closed=False)
         else:
             self.guard.stop()
+
+    async def _describe_now(self) -> str:
+        """What the local vision model sees right now. Used by behaviours."""
+        img = self.last_image_b64
+        if img is None and not self.static_image_b64:
+            _, img = self.camera.latest_jpeg_b64()
+        img = img or self.static_image_b64
+        if not img:
+            return ""
+        return await self.vlm.describe(img) or ""
 
     # ---------------- runtime reconfiguration ----------------
 
@@ -332,6 +382,7 @@ class Loop:
             self.robot.stop()
             if not self.static_image_b64:
                 self.camera.stop()
+            self.narrator.close()
             await self.vlm.aclose()
             await self.cloud.aclose()
 

@@ -9,9 +9,11 @@ Design rules:
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -20,6 +22,146 @@ from pathlib import Path
 from typing import Any, Callable
 
 log = logging.getLogger(__name__)
+
+
+# Characters and constructs that a speech synthesiser reads out literally, or
+# stumbles over. Text reaching TTS comes from three places - an LLM reply, a
+# VLM description, and generated code - and none of them are writing for the
+# ear. "Room scan - -60 deg: I see..." is not a sentence, it is a log line.
+_MD = re.compile(r"[*_`#>~|]+")
+_BRACKETS = re.compile(r"[\[\](){}<>]")
+_URL = re.compile(r"https?://\S+")
+_EMOJI = re.compile("[\U0001F000-\U0001FAFF\U00002600-\U000027BF]")
+_MULTI_PUNCT = re.compile(r"([.,!?])\1+")
+_SPACE = re.compile(r"\s+")
+_NEG_NUM = re.compile(r"(?<![\w])-(\d)")
+_DEGREES = re.compile(r"\b(-?\d+)\s*(?:deg|degs|degrees)\b", re.I)
+_ABBREV = [
+    (re.compile(r"\bpan\b", re.I), "pan"),
+    (re.compile(r"\be\.g\.", re.I), "for example"),
+    (re.compile(r"\bi\.e\.", re.I), "that is"),
+    (re.compile(r"\betc\.?", re.I), "and so on"),
+    (re.compile(r"\bvs\.?\b", re.I), "versus"),
+    (re.compile(r"\bapprox\.?\b", re.I), "about"),
+]
+
+
+def for_speech(text: str, max_chars: int = 600) -> str:
+    """Turn machine text into something worth hearing.
+
+    Not cosmetic: Piper reads stray punctuation aloud, so an unfiltered log
+    line becomes audible gibberish. Symbols are removed or spoken properly,
+    list separators become sentence breaks, and the result is trimmed at a
+    sentence boundary rather than mid-word.
+    """
+    if not text:
+        return ""
+    t = _URL.sub("a link", str(text))
+    # Arrows first: "=>" must not become "equals >" and then "equals equals".
+    for arrow in ("=>", "->", "-->", "<-", "→"):
+        t = t.replace(arrow, " then ")
+    t = _EMOJI.sub(" ", t)
+    t = _MD.sub(" ", t)
+    t = _BRACKETS.sub(" ", t)
+    t = _DEGREES.sub(r"\1 degrees", t)
+    t = _NEG_NUM.sub(r"minus \1", t)         # "-60" -> "minus 60", not "dash 60"
+    for pat, repl in _ABBREV:
+        t = pat.sub(repl, t)
+    # Separators that are punctuation on a page but silence in the ear.
+    t = t.replace(";", ".").replace(" - ", ", ").replace(" -- ", ", ")
+    t = t.replace(":", ",").replace(" / ", " or ")
+    t = t.replace("=", " is ").replace("&", " and ").replace("%", " percent")
+    t = re.sub(r"(\d)\s*/\s*(\d)", r"\1 of \2", t)   # "3/5" -> "3 of 5"
+    t = t.replace("_", " ")
+    t = _MULTI_PUNCT.sub(r"\1", t)
+    t = _SPACE.sub(" ", t).strip(" ,.-")
+
+    t = t.strip(" ,")
+    if t and t[-1] not in ".!?":
+        t += "."
+    t = _pace(t)
+    # Cap last, so pacing cannot push the result back over the limit.
+    if len(t) > max_chars:
+        cut = t[:max_chars]
+        stop = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+        t = cut[:stop + 1] if stop > max_chars // 3 else cut.rsplit(" ", 1)[0]
+        if t and t[-1] not in ".!?":
+            t += "."
+    return t
+
+
+# Sentences longer than this have nowhere to breathe. Piper paces on
+# punctuation, so a 40-word clause chain is delivered as one unbroken run -
+# which is what "unpaced transliteration" sounds like.
+_LONG_RUN = 18
+
+
+def _pace(text: str) -> str:
+    """Give the synthesiser somewhere to breathe.
+
+    Breaks over-long sentences at natural clause joints into separate
+    sentences, so Piper emits them as distinct chunks with a real pause
+    between, rather than one continuous run.
+    """
+    out: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        words = sentence.split()
+        if len(words) <= _LONG_RUN:
+            out.append(sentence)
+            continue
+        # Prefer breaking where the speaker would: after a comma, or before a
+        # conjunction. Falls back to a hard split so nothing runs away.
+        chunk: list[str] = []
+        for w in words:
+            # Break *before* a conjunction, not after it - closing a sentence
+            # on "and." is worse than not breaking at all.
+            if len(chunk) >= 8 and w.lower() in ("and", "but", "then", "so"):
+                out.append(" ".join(chunk).rstrip(",") + ".")
+                chunk = [w]
+                continue
+            chunk.append(w)
+            if len(chunk) >= 8 and w.endswith(","):
+                out.append(" ".join(chunk).rstrip(",") + ".")
+                chunk = []
+            elif len(chunk) >= _LONG_RUN + 6:
+                out.append(" ".join(chunk).rstrip(",") + ".")
+                chunk = []
+        if chunk:
+            # A trailing fragment of one or two words belongs to the previous
+            # sentence, not alone.
+            tail = " ".join(chunk)
+            if len(chunk) <= 2 and out:
+                out[-1] = out[-1].rstrip(".") + " " + tail
+            else:
+                out.append(tail)
+    paced = " ".join(p for p in out if p.strip(" ."))
+    if paced and paced[-1] not in ".!?":
+        paced += "."
+    return paced
+
+
+def _run_coro(coro):
+    """Run a coroutine to completion from any thread.
+
+    dispatch() is synchronous and gets called both from the event loop (an
+    agent turn) and from worker threads (a skill, the sandbox bridge), so it
+    cannot assume whether a loop is already running here. A fresh thread with
+    its own loop is correct in both cases and costs nothing at this rate.
+    """
+    box: dict = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+            box["error"] = exc
+
+    t = threading.Thread(target=runner, name="tool-async", daemon=True)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value", {"ok": False, "error": "no result"})
 
 
 def _piper_ready() -> bool:
@@ -134,6 +276,126 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["key", "value"],
         },
     },
+    {
+        "name": "define_skill",
+        "description": (
+            "Teach yourself a new named routine so you can do it again later on request. "
+            "A skill is a sequence of your OWN tool calls - you cannot write code. Use this "
+            "when someone says 'whenever I ask you to X, do Y' or 'learn this'. Read the "
+            "steps back to them in plain words afterwards so they can confirm. "
+            "Parameters let a skill be reused: declare them in 'params' and refer to them "
+            "in step arguments as {name}."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "short lowercase name, e.g. 'patrol'"},
+                "description": {"type": "string", "description": "what it does, one line"},
+                "params": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "names of values supplied when the skill is run",
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "tool calls, in order",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "description": "name of one of your tools"},
+                            "args": {"type": "object", "description": "arguments; may use {param}"},
+                            "repeat": {"type": "integer", "description": "run this step N times (1-10)"},
+                            "when": {
+                                "type": "object",
+                                "description": (
+                                    "run only if an earlier step matched, e.g. "
+                                    '{"after": 0, "key": "ok", "equals": true}'
+                                ),
+                            },
+                        },
+                        "required": ["tool"],
+                    },
+                },
+            },
+            "required": ["name", "steps"],
+        },
+    },
+    {
+        "name": "run_skill",
+        "description": "Run a routine you were taught earlier. Check list_skills if unsure of the name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "values": {"type": "object", "description": "values for the skill's parameters"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "list_skills",
+        "description": "List the routines you have been taught, with what each one does.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "forget_skill",
+        "description": "Delete a routine you were taught.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "write_behavior",
+        "description": (
+            "Write NEW PYTHON CODE for yourself, to do something your existing tools cannot "
+            "already do, and save it under a name. Use this when someone says 'program "
+            "yourself to...', 'write code to...', or asks for a capability you lack. "
+            "The code is generated in the cloud and runs in a locked-down container. "
+            "Put the FULL request in 'request' - the code generator cannot see this "
+            "conversation. Afterwards, describe in plain words what it does."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "lowercase identifier, e.g. 'patrol'"},
+                "request": {
+                    "type": "string",
+                    "description": "complete description of the behaviour, in plain English",
+                },
+            },
+            "required": ["name", "request"],
+        },
+    },
+    {
+        "name": "run_behavior",
+        "description": (
+            "Run a coded behaviour you wrote earlier, in the sandbox. "
+            "Check list_behaviors if unsure of the name."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "params": {"type": "object", "description": "values passed to the behaviour"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "list_behaviors",
+        "description": "List the coded behaviours you have written.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_behavior",
+        "description": "Read back a behaviour's source, so you can explain or check it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
 ]
 
 SETTABLE = {"vlm_interval", "cam_width", "cam_height", "cloud_min_interval"}
@@ -142,18 +404,63 @@ SETTABLE = {"vlm_interval", "cam_width", "cam_height", "cloud_min_interval"}
 class ToolBox:
     """Dispatches model tool calls to the robot."""
 
-    def __init__(self, loop, guard, camera, faces, speaker) -> None:
+    # Handlers that are coroutines. dispatch() is called from worker threads
+    # as well as the event loop, so these get their own loop rather than
+    # assuming one is running on the calling thread.
+    ASYNC_TOOLS = {"write_behavior", "run_behavior"}
+
+    def __init__(self, loop, guard, camera, faces, speaker, skills=None,
+                 writer=None, behaviors=None) -> None:
         self._loop = loop
         self._guard = guard
         self._camera = camera
         self._faces = faces
         self._speaker = speaker
+        self._skills = skills
+        self._writer = writer
+        self._behaviors = behaviors
+        self._runner = None
+        if skills is not None:
+            from .skills import SkillRunner
+
+            # The runner dispatches back through this same ToolBox, so every
+            # step inside a skill gets the identical gating a direct call does.
+            self._runner = SkillRunner(skills, self.dispatch)
+        self._depth = 0
+
+    async def dispatch_async(self, name: str, args: dict) -> dict:
+        """Dispatch from the event loop, awaiting coroutine handlers natively.
+
+        The async tools reach the cloud over the shared httpx client, which is
+        bound to the loop that created it. Running them on a private loop
+        raises "bound to a different event loop", so callers that *have* a loop
+        must use this rather than dispatch().
+        """
+        if name not in self.ASYNC_TOOLS:
+            return self.dispatch(name, args)
+        fn = getattr(self, f"_t_{name}", None)
+        if fn is None:
+            return {"ok": False, "error": f"unknown tool {name!r}"}
+        try:
+            return await fn(**(args or {}))
+        except TypeError as exc:
+            return {"ok": False, "error": f"bad arguments for {name}: {exc}"}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("tool %s failed", name)
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def dispatch(self, name: str, args: dict) -> dict:
         fn: Callable[..., dict] | None = getattr(self, f"_t_{name}", None)
         if fn is None:
             return {"ok": False, "error": f"unknown tool {name!r}"}
         try:
+            if name in self.ASYNC_TOOLS:
+                # Reached from a worker thread (a skill, the sandbox bridge).
+                # These tools need the loop's httpx client, so refuse clearly
+                # instead of failing deep inside with a cross-loop error.
+                return {"ok": False,
+                        "error": f"{name} can only be called directly by the agent, "
+                                 f"not from inside a skill or a behaviour"}
             return fn(**(args or {}))
         except TypeError as exc:
             return {"ok": False, "error": f"bad arguments for {name}: {exc}"}
@@ -210,6 +517,76 @@ class ToolBox:
             return {"ok": False, "error": "face recognition is not available on this robot"}
         return {"ok": True, "names": self._faces.list_names()}
 
+    # ---- skills ----
+    def _t_define_skill(self, name: str, steps: list, description: str = "",
+                        params: list | None = None) -> dict:
+        if self._skills is None:
+            return {"ok": False, "error": "skills are not available on this robot"}
+        from .skills import validate
+
+        known = {t["name"] for t in TOOL_SCHEMAS}
+        try:
+            skill = validate(name, description, steps, params or [], known)
+            self._skills.add(skill)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "name": skill.name, "steps": len(skill.steps),
+                "params": skill.params,
+                "detail": f"learned {skill.name!r}; say the name to run it"}
+
+    def _t_run_skill(self, name: str, values: dict | None = None) -> dict:
+        if self._runner is None:
+            return {"ok": False, "error": "skills are not available on this robot"}
+        # A skill may not call itself, directly or through another skill.
+        if self._depth >= 2:
+            return {"ok": False, "error": "skills cannot nest this deeply"}
+        self._depth += 1
+        try:
+            return self._runner.run(name, values or {})
+        finally:
+            self._depth -= 1
+
+    def _t_list_skills(self) -> dict:
+        if self._skills is None:
+            return {"ok": False, "error": "skills are not available on this robot"}
+        return {"ok": True, "skills": [
+            {"name": s.name, "description": s.description, "params": s.params,
+             "steps": len(s.steps)} for s in self._skills.all()]}
+
+    def _t_forget_skill(self, name: str) -> dict:
+        if self._skills is None:
+            return {"ok": False, "error": "skills are not available on this robot"}
+        return ({"ok": True, "detail": f"forgot {name!r}"} if self._skills.forget(name)
+                else {"ok": False, "error": f"no skill called {name!r}"})
+
+    # ---- generated behaviours ----
+    async def _t_write_behavior(self, name: str, request: str) -> dict:
+        if self._writer is None or not self._writer.available:
+            return {"ok": False, "error": "code generation needs a cloud provider configured"}
+        out = await self._writer.write(name, request)
+        # The source can be long and the model already knows what it asked for;
+        # return a preview so the tool result stays readable.
+        if out.get("ok") and "source" in out:
+            out["preview"] = "\n".join(out.pop("source").splitlines()[:20])
+        return out
+
+    async def _t_run_behavior(self, name: str, params: dict | None = None) -> dict:
+        if self._behaviors is None:
+            return {"ok": False, "error": "behaviours are not available on this robot"}
+        return await self._behaviors.run(name, params or {})
+
+    def _t_list_behaviors(self) -> dict:
+        if self._behaviors is None:
+            return {"ok": False, "error": "behaviours are not available on this robot"}
+        return {"ok": True, "behaviors": self._behaviors.store.names()}
+
+    def _t_read_behavior(self, name: str) -> dict:
+        if self._behaviors is None:
+            return {"ok": False, "error": "behaviours are not available on this robot"}
+        src = self._behaviors.store.read(name)
+        return ({"ok": True, "name": name, "source": src} if src is not None
+                else {"ok": False, "error": f"no behaviour called {name!r}"})
+
     def _t_set_config(self, key: str, value: str) -> dict:
         if key not in SETTABLE:
             return {"ok": False, "error": f"{key!r} is not settable; allowed: {sorted(SETTABLE)}"}
@@ -228,9 +605,13 @@ class Speaker:
     Tegra APE virtual card, and relying on it is how a robot talks into a void.
     """
 
-    def __init__(self, device: str = "auto", voice: str | None = None) -> None:
+    def __init__(self, device: str = "auto", voice: str | None = None,
+                 narrator=None) -> None:
         from .audio import pick_speaker
 
+        # Machine text is rephrased before it is spoken; for_speech() is the
+        # mechanical fallback when the narrator is off or unreachable.
+        self._narrator = narrator
         self._device = pick_speaker(device)
         self._engine: str | None = None
         self._piper_voice = self._find_voice(voice)
@@ -272,6 +653,39 @@ class Speaker:
         found = sorted(vdir.glob("*.onnx")) if vdir.is_dir() else []
         return str(found[0]) if found else None
 
+    # Pacing. The failure this fixes is not bad words, it is bad delivery:
+    # Piper renders a whole utterance as one continuous run, so clause after
+    # clause arrives with no pause and the listener has nothing to parse
+    # against. Slowing very slightly and inserting real silence at sentence
+    # boundaries is the difference between a transliteration and speech.
+    RATE = float(os.environ.get("JETTANK_TTS_RATE", "1.06"))          # >1 slower
+    SENTENCE_GAP_MS = int(os.environ.get("JETTANK_TTS_GAP_MS", "260"))
+    CLAUSE_GAP_MS = int(os.environ.get("JETTANK_TTS_CLAUSE_GAP_MS", "90"))
+
+    def _syn_config(self):
+        """Piper's own gain stage.
+
+        The USB speakerphone tops out at -2.5 dB even with the ALSA PCM control
+        at 100%, so if that is still not loud enough the remaining headroom has
+        to come from synthesis. `volume` is a linear multiplier; above ~1.5 it
+        starts to clip, hence the cap. `normalize_audio` evens out quiet
+        phrases, which matters more than peak level for intelligibility.
+        """
+        gain = float(os.environ.get("JETTANK_TTS_GAIN", "1.0"))
+        try:
+            from piper import SynthesisConfig
+
+            return SynthesisConfig(volume=max(0.1, min(gain, 2.0)),
+                                   length_scale=max(0.8, min(self.RATE, 1.6)),
+                                   normalize_audio=True)
+        except Exception as exc:  # noqa: BLE001 - older piper lacks it
+            log.debug("SynthesisConfig unavailable (%s)", exc)
+            return None
+
+    @staticmethod
+    def _silence(rate: int, ms: int) -> bytes:
+        return b"\x00" * (2 * int(rate * ms / 1000))
+
     def _load_piper(self):
         """Load the voice once and keep it.
 
@@ -295,20 +709,35 @@ class Speaker:
         voice = self._load_piper()
         proc = None
         played = 0
+        syn = self._syn_config()
+        rate = 22050
         try:
-            for chunk in voice.synthesize(text):
+            for chunk in (voice.synthesize(text, syn) if syn
+                          else voice.synthesize(text)):
                 pcm = getattr(chunk, "audio_int16_bytes", None)
                 if pcm is None:  # older piper returned raw arrays
                     pcm = bytes(chunk.audio_int16_array)
                 if proc is None:
+                    rate = getattr(chunk, "sample_rate", 22050)
                     proc = subprocess.Popen(
                         ["aplay", "-q", "-D", self._device, "-f", "S16_LE",
-                         "-r", str(getattr(chunk, "sample_rate", 22050)),
+                         "-r", str(rate),
                          "-c", str(getattr(chunk, "sample_channels", 1)), "-t", "raw", "-"],
                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                proc.stdin.write(pcm)
+                else:
+                    # Piper yields one chunk per sentence, so the gap between
+                    # chunks is exactly where a speaker would draw breath.
+                    pcm = self._silence(rate, self.SENTENCE_GAP_MS) + pcm
+                try:
+                    proc.stdin.write(pcm)
+                except BrokenPipeError:
+                    # aplay exited early - almost always the ALSA device being
+                    # held by another process. Report it; do not crash.
+                    return {"ok": False, "spoken_text": text,
+                            "error": f"audio device {self._device} unavailable "
+                                     f"(is something else using it?)"}
                 played += len(pcm)
         finally:
             if proc is not None:
@@ -325,6 +754,16 @@ class Speaker:
                               capture_output=True, timeout=30).stdout
 
     def say(self, text: str) -> dict:
+        if self._narrator is not None:
+            try:
+                text = self._narrator.narrate(str(text))
+            except Exception as exc:  # noqa: BLE001 - never block speech
+                log.warning("narration failed (%s)", exc)
+        spoken = for_speech(text)
+        if not spoken:
+            return {"ok": False, "error": "nothing speakable in that text",
+                    "spoken_text": ""}
+        text = spoken
         if self._engine is None:
             log.info("[speak] %s", text)
             return {"ok": False, "error": "no TTS engine available (pip install piper-tts, or apt install espeak-ng)",
