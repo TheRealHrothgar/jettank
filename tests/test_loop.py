@@ -15,6 +15,7 @@ import tests.fake_httpx as fake  # noqa: E402
 stub = types.ModuleType("httpx")
 stub.AsyncClient = fake.AsyncClient
 stub.HTTPStatusError = fake.HTTPStatusError
+stub.Timeout = fake.Timeout
 sys.modules["httpx"] = stub
 
 from jettank.cloud import CloudAgent  # noqa: E402
@@ -621,6 +622,72 @@ check("a disarmed guard refuses drive", guard5.drive(0.1, 0.0)[0] is False)
 check("no tool clears an estop",
       not ({"clear_estop", "reset_estop"} & {t["name"] for t in TOOL_SCHEMAS}))
 guard5.close()
+
+# ---------- battery supervision ----------
+print("\nBattery (untethered operation)")
+from jettank.power import CRITICAL_V, DISARM_V, WARN_V, BatteryMonitor  # noqa: E402
+
+
+def batt(volts, n=15):
+    m = BatteryMonitor(None)
+    for v in (volts if isinstance(volts, list) else [volts] * n):
+        m.sample(v)
+    return m
+
+
+m = batt(12.4)
+check("a healthy pack says nothing", m.assess() is None and m.state == "ok")
+
+m = batt(11.0)
+msg = m.assess()
+check("a low pack warns", m.state == "warn" and msg and "low" in msg.lower(), str(msg))
+check("warning does not disarm", m.disarmed_for_battery is False)
+
+m = batt(10.4)
+msg = m.assess()
+check("a lower pack disarms", m.state == "disarm", str(msg))
+check("disarming is announced", msg and "motors" in msg.lower(), str(msg))
+check("the disarm is recorded", m.disarmed_for_battery is True)
+
+m = batt(10.0)
+check("a flat pack is critical", m.assess() and m.state == "critical")
+
+# Voltage sags hard under a motor start. Acting on that transient would disarm
+# a healthy robot every time it set off, so decisions use a rolling median.
+m = batt([12.4] * 14 + [9.5])
+check("a single sag does not trip anything", m.assess() is None, str(m.voltage))
+check("the median ignores the spike", m.voltage == 12.4, str(m.voltage))
+
+# Too few samples to trust means no decision at all.
+m = BatteryMonitor(None)
+m.sample(9.0)
+check("one reading decides nothing", m.voltage is None and m.assess() is None)
+
+# Obvious garbage from a dropped frame must not be believed.
+m = batt([12.4] * 10 + [0.0] * 5)
+check("zero-volt reads are ignored", m.voltage == 12.4, str(m.voltage))
+
+# Thresholds must stay ordered, or the escalation is nonsense.
+check("thresholds are correctly ordered", CRITICAL_V < DISARM_V < WARN_V,
+      f"{CRITICAL_V} {DISARM_V} {WARN_V}")
+check("disarm has real headroom above critical", DISARM_V - CRITICAL_V >= 0.3)
+
+# Recovery needs daylight, not a flicker back over the line.
+m = batt(11.0)
+m.assess()
+for _ in range(15):
+    m.sample(11.2)
+check("a marginal rise does not clear the warning", m.assess() is None, m.state)
+for _ in range(15):
+    m.sample(11.8)
+check("a clear rise does clear it", m.assess() is not None and m.state == "ok")
+
+# The unit must not block the safety shutdown or a no-network boot.
+unit = (ROOT / "deploy" / "hank.service").read_text()
+check("NoNewPrivileges does not block the battery shutdown",
+      "NoNewPrivileges=true" not in unit)
+check("the network is wanted, never required",
+      "Requires=network" not in unit and "Wants=network-online" not in unit)
 
 # ---------- live reload ----------
 print("\nLive reload (apply edits without a restart)")

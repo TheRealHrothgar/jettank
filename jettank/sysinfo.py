@@ -168,6 +168,11 @@ def describe(facts: dict) -> str:
             f"you are physically moving. If someone asks your battery, read it from "
             f"your status rather than guessing.")
 
+    if not facts.get("cloud_enabled"):
+        lines.append(
+            "- You have NO cloud connection right now. You can still see with your "
+            "local vision model, hear, speak and read your own sensors. Say so "
+            "plainly if you cannot do something for that reason.")
     lines.append(
         "- Whether your motors are armed is a person's decision, never yours. "
         "'Hank arm motion' spoken aloud arms them; 'Hank disarm' turns them off, "

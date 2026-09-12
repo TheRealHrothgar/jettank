@@ -9,6 +9,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
+import time
 import httpx
 
 log = logging.getLogger(__name__)
@@ -71,8 +73,18 @@ class CloudAgent:
         self._model = model
         self._key = api_key
         self._max_tokens = max_tokens
+        # Circuit breaker. Untethered, the cloud is simply gone sometimes, and
+        # retrying a dead endpoint across eight agent turns took 46 seconds to
+        # report what the first failure already knew.
+        self._offline_until = 0.0
         self._base = base_url.rstrip("/") if base_url else self._default_base()
-        self._client = httpx.AsyncClient(timeout=timeout_s)
+        # Connect and read are budgeted separately on purpose. A model that
+        # thinks for forty seconds is normal; a TCP handshake that takes forty
+        # seconds means there is no network, and waiting the full read budget to
+        # learn that is the difference between "offline" and "hung".
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_s, connect=float(
+                os.environ.get("JETTANK_CLOUD_CONNECT_TIMEOUT", "6.0"))))
 
     def _default_base(self) -> str:
         if self._provider == "anthropic":
@@ -121,6 +133,8 @@ class CloudAgent:
             return None
         return self._parse(raw)
 
+    OFFLINE_BACKOFF_S = 20.0
+
     async def _messages(self, messages: list[dict], tools: list[dict] | None = None,
                         system: str | None = None,
                         max_tokens: int | None = None) -> dict | None:
@@ -130,6 +144,9 @@ class CloudAgent:
         magnitude: the planner emits a small JSON object, while an agent turn
         may carry a long code-generation request in a single tool call.
         """
+        if time.monotonic() < getattr(self, "_offline_until", 0.0):
+            log.debug("cloud believed offline; not retrying yet")
+            return None
         body: dict = {
             "model": self._model,
             "max_tokens": max_tokens or self._max_tokens,
@@ -158,8 +175,21 @@ class CloudAgent:
                 reply["_truncated"] = True
             return reply
         except Exception as exc:  # noqa: BLE001 - cloud is best-effort
-            log.warning("cloud messages call failed: %s", exc)
+            # Connection-level failures mean the network is gone, not that this
+            # request was bad. Stop hammering it for a bit.
+            if not isinstance(exc, self._http_status_error()):
+                self._offline_until = time.monotonic() + self.OFFLINE_BACKOFF_S
+                log.warning("cloud unreachable (%s); pausing calls for %.0fs",
+                            type(exc).__name__, self.OFFLINE_BACKOFF_S)
+            else:
+                log.warning("cloud messages call failed: %s", exc)
             return None
+
+    @staticmethod
+    def _http_status_error():
+        import httpx
+
+        return httpx.HTTPStatusError
 
     async def _anthropic(self, user: str, image_b64: str | None = None) -> str:
         content: list[dict] = []

@@ -539,6 +539,10 @@ class ToolBox:
         board = getattr(self._loop, "board", None)
         if board is not None:
             st.update(board.status())
+        batt = getattr(self._loop, "battery", None)
+        if batt is not None and batt.voltage is not None:
+            st["battery_state"] = batt.state
+            st["battery_v"] = batt.voltage
         st["recent_observations"] = list(self._loop.observations)[-5:]
         st["camera"] = getattr(self._camera, "_device", "unknown")
         st["enrolled_faces"] = self._faces.list_names() if self._faces else []

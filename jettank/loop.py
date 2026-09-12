@@ -34,6 +34,7 @@ from .cloud import AgentSession, CloudAgent, register_tools
 from .faces import FaceEngine
 from .live import Reloader
 from .narrator import Narrator
+from .power import BatteryMonitor
 from .robot import build as build_robot
 from .safety import MotionGuard
 from .tools import TOOL_SCHEMAS, Speaker, ToolBox
@@ -142,8 +143,10 @@ class Loop:
         self._work: asyncio.Task | None = None
         self._killed = False
         self.reloader = Reloader(self)
+        self.battery = BatteryMonitor(self)
         self._arm_requested = 0.0
         self.reloader = Reloader(self)
+        self.battery = BatteryMonitor(self)
 
         self.transcript: deque[dict] = deque(maxlen=32)
         self.observations: deque[str] = deque(maxlen=32)
@@ -505,6 +508,37 @@ class Loop:
             self.say("Reloaded." if bits else "Nothing had changed.")
         return {"ok": True, **result}
 
+    async def battery_forever(self) -> None:
+        """Watch the pack and act before a brown-out corrupts the disk.
+
+        Runs regardless of whether anyone is talking to him: the risk is
+        highest exactly when he has been left running unattended.
+        """
+        while not self._stop.is_set():
+            await asyncio.sleep(1.0)
+            t = self.board.latest()
+            if t is None:
+                continue
+            self.battery.sample(t.battery_v)
+            message = self.battery.assess()
+            if not message:
+                continue
+            log.warning("[power] %s", message)
+            if self.console:
+                self.console.event("err", message)
+
+            if self.battery.state == "disarm" and self.guard.status().get("motion_enabled"):
+                self.guard.enable(False)
+                self.guard.stop()
+            self.say(message)
+
+            if self.battery.state == "critical":
+                self.guard.enable(False)
+                self.guard.stop()
+                await asyncio.sleep(4.0)      # let him finish the sentence
+                self.battery.shutdown()
+                return
+
     async def watch_forever(self) -> None:
         """Reload automatically when a watched file changes on disk.
 
@@ -594,6 +628,7 @@ class Loop:
             asyncio.create_task(self.perceive_forever()),
             asyncio.create_task(self.status_forever()),
             asyncio.create_task(self.watch_forever()),
+            asyncio.create_task(self.battery_forever()),
         ]
         if self.voice is not None:
             tasks.append(asyncio.create_task(self.listen_forever()))

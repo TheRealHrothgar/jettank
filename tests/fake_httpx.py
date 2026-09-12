@@ -38,3 +38,10 @@ class AsyncClient:
 
     async def aclose(self):
         return None
+
+
+class Timeout:
+    """Stub for httpx.Timeout - the real client budgets connect separately."""
+
+    def __init__(self, timeout=None, connect=None, **kw):
+        self.timeout, self.connect = timeout, connect

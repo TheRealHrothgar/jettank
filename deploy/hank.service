@@ -4,8 +4,13 @@ Description=Hank the Tank - voice and console command and control
 # is down (perception degrades, speech falls back), so this is Wants, not
 # Requires - a robot that refuses to boot because a model server is missing is
 # less useful than one that boots and says so.
+# Wants, never Requires, and the ordering is best-effort throughout: he must
+# come up on battery with no Wi-Fi at all. Without the cloud he still sees
+# locally, still hears, still speaks, and still refuses to move - he just
+# cannot reason about anything. Blocking startup on a network that is not
+# coming back would turn a degraded robot into a dead one.
 After=network-online.target ollama.service sound.target
-Wants=network-online.target ollama.service
+Wants=ollama.service
 
 [Service]
 Type=simple
@@ -37,9 +42,12 @@ RestartPreventExitStatus=42
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
-# Motion is gated in software regardless, but a service that cannot write
-# outside its own state has one less way to surprise anyone.
-NoNewPrivileges=true
+# ProtectSystem keeps him out of /usr and /boot, which is worth having.
+#
+# NoNewPrivileges is deliberately NOT set. It blocks sudo, and the battery
+# supervisor needs to run `shutdown` when the pack is nearly flat - a brown-out
+# mid-write corrupts the NVMe that everything boots from. A hardening flag that
+# disables the safety shutdown is a bad trade on a battery-powered robot.
 ProtectSystem=full
 ProtectHome=false
 PrivateTmp=false
