@@ -6,6 +6,7 @@ the latest one and drops everything else.
 from __future__ import annotations
 
 import base64
+import contextlib
 import logging
 import os
 import shutil
@@ -81,12 +82,194 @@ class GStreamerCamera:
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 
+def auto_expose(device: str, target: int = 115, tries: int = 8) -> dict:
+    """Set gain and exposure so frames are actually usable.
+
+    This matters more than it sounds. The camera ships with gain at 0 and
+    aperture-priority auto-exposure, and in the room this robot lives in that
+    produced frames averaging 4/255 - effectively black. The object detector
+    found nothing for several rounds of testing and the obvious suspects
+    (model, threshold, lighting) were all wrong: the camera simply was not
+    exposing.
+
+    Switches to manual exposure and searches for a mid-grey average. Manual
+    rather than auto because auto-exposure hunts as the robot drives between
+    light and shade, and a detector fed a hunting exposure sees objects appear
+    and vanish.
+    """
+    import base64
+    import io
+    import subprocess
+
+    def apply(**kw):
+        args: list[str] = []
+        for k, v in kw.items():
+            args += ["-c", f"{k}={v}"]
+        subprocess.run(["v4l2-ctl", "-d", device] + args,
+                       capture_output=True, timeout=5)
+
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        log.debug("numpy/PIL unavailable - leaving camera exposure alone")
+        return {}
+
+    cam = build_camera(device, 640, 480, 30)
+    cam.start()
+    time.sleep(1.2)
+    exposure, gain, measured = 2500, 100, 0.0
+    try:
+        for _ in range(tries):
+            apply(auto_exposure=1, exposure_time_absolute=exposure,
+                  gain=gain, brightness=0)
+            # The sensor keeps delivering frames captured under the OLD
+            # settings for a moment. Measuring one of those latched onto a
+            # reading of 123 while the camera actually settled at 251 - a
+            # blown-out frame the detector could do nothing with. Discard a
+            # few, then average, so the number is what the camera is really
+            # producing rather than what it was producing a moment ago.
+            samples: list[float] = []
+            for n in range(6):
+                time.sleep(0.35)
+                _, b64 = cam.latest_jpeg_b64()
+                if not b64:
+                    continue
+                value = float(np.asarray(
+                    Image.open(io.BytesIO(base64.b64decode(b64)))).mean())
+                if n >= 3:                 # first three are stale
+                    samples.append(value)
+            if not samples:
+                continue
+            measured = sum(samples) / len(samples)
+            if abs(measured - target) < 18:
+                break
+            if measured > target:
+                # Drop gain before exposure: gain adds noise, and a detector
+                # on a noisy frame invents boxes.
+                if gain > 10:
+                    gain = max(0, int(gain * target / max(measured, 1)))
+                else:
+                    exposure = max(20, int(exposure * target / max(measured, 1)))
+            elif exposure < 4000:
+                exposure = min(5000, int(exposure * target / max(measured, 1)))
+            else:
+                gain = min(100, gain + 20)
+    except Exception as exc:  # noqa: BLE001 - never block startup on this
+        log.warning("auto-exposure failed (%s)", exc)
+    finally:
+        cam.stop()
+    log.info("camera exposure set: exposure=%d gain=%d (mean %.0f/255)",
+             exposure, gain, measured)
+    return {"exposure": exposure, "gain": gain, "mean": round(measured)}
+
+
+class StreamingCamera:
+    """One long-lived GStreamer pipeline, frames parsed off its stdout.
+
+    The per-frame subprocess version costs ~800ms a frame, which was fine when
+    the only consumer was a vision model taking ten seconds anyway. It is not
+    fine for a control loop: measured on the robot, the obstacle-avoidance
+    drive ran at 1.1Hz with an 80ms detector, so the camera was 90% of the
+    cycle and Hank travelled ~16cm between looks.
+
+    Keeping the pipeline open and reading MJPEG frames as they arrive removes
+    that entirely. JPEG framing is self-delimiting - SOI ffd8ff to EOI ffd9 -
+    so no container parsing is needed.
+    """
+
+    SOI = b"\xff\xd8\xff"
+    EOI = b"\xff\xd9"
+
+    def __init__(self, device: str, width: int, height: int, fps: int = 30) -> None:
+        self._device = device if device.startswith("/dev/") else f"/dev/video{device}"
+        self._width, self._height, self._fps = width, height, fps
+        self._proc = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._latest: bytes | None = None
+        self._seq = 0
+
+    def start(self) -> None:
+        # Idempotent: build_camera() starts the pipeline to prove the device
+        # works, and callers start it again. Spawning a second gst-launch on
+        # the same device fails in a confusing way.
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        if not shutil.which("gst-launch-1.0"):
+            raise RuntimeError("gst-launch-1.0 not found")
+        if not os.path.exists(self._device):
+            raise RuntimeError(f"{self._device} does not exist")
+        self._proc = subprocess.Popen(
+            ["gst-launch-1.0", "-q", "v4l2src", f"device={self._device}",
+             "!", f"image/jpeg,width={self._width},height={self._height}",
+             "!", "fdsink", "fd=1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._read, name="camera", daemon=True)
+        self._thread.start()
+        for _ in range(50):                      # up to 5s for the first frame
+            if self._latest is not None:
+                log.info("streaming camera ready on %s", self._device)
+                return
+            time.sleep(0.1)
+        self.stop()
+        raise RuntimeError(f"no frame from {self._device}")
+
+    def _read(self) -> None:
+        buf = bytearray()
+        while not self._stop.is_set() and self._proc and self._proc.stdout:
+            chunk = self._proc.stdout.read(65536)
+            if not chunk:
+                return
+            buf += chunk
+            # Keep only the most recent complete frame; a control loop wants
+            # the freshest image, never a backlog.
+            end = buf.rfind(self.EOI)
+            if end == -1:
+                if len(buf) > 4_000_000:         # runaway guard
+                    del buf[:-65536]
+                continue
+            start = buf.rfind(self.SOI, 0, end)
+            if start == -1:
+                del buf[:end + 2]
+                continue
+            with self._lock:
+                self._latest = bytes(buf[start:end + 2])
+                self._seq += 1
+            del buf[:end + 2]
+
+    def latest_jpeg_b64(self, quality: int = 80):
+        with self._lock:
+            data, seq = self._latest, self._seq
+        if not data:
+            return 0, None
+        return seq, base64.b64encode(data).decode("ascii")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc is not None:
+            with contextlib.suppress(Exception):
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            self._proc = None
+
+
 def build_camera(device: str, width: int, height: int, fps: int):
     """Return the best available camera backend.
 
-    OpenCV gives a proper threaded grabber; GStreamer is the fallback for the
-    robot, where OpenCV is not installed.
+    Streaming GStreamer first: it keeps one pipeline open and is ~10x faster
+    per frame than respawning gst-launch, which is the difference between a
+    control loop at 1Hz and one at 8Hz.
     """
+    try:
+        cam = StreamingCamera(device, width, height, fps)
+        cam.start()
+        return cam
+    except Exception as exc:  # noqa: BLE001
+        log.info("streaming camera unavailable (%s) - falling back", exc)
+
     try:
         import cv2  # noqa: F401
     except ImportError:

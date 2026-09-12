@@ -43,6 +43,10 @@ class CameraConfig:
     width: int = field(default_factory=lambda: _env_i("JETTANK_CAM_WIDTH", 640))
     height: int = field(default_factory=lambda: _env_i("JETTANK_CAM_HEIGHT", 480))
     fps: int = field(default_factory=lambda: _env_i("JETTANK_CAM_FPS", 30))
+    # Measure and set gain/exposure at startup. Off by default only if the
+    # camera is known-good; on here because this one ships at gain 0 and
+    # returns near-black frames indoors.
+    auto_expose: bool = field(default_factory=lambda: _env_b("JETTANK_AUTO_EXPOSE", True))
 
 
 @dataclass(frozen=True)

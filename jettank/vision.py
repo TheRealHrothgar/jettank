@@ -102,6 +102,33 @@ class PersonDetector:
             log.warning("could not load detector (%s)", exc)
             return False
 
+    def raw(self, jpeg_b64: str):
+        """Run the model and return (boxes, classes, scores) for ALL classes.
+
+        detect() filters to people; obstacle avoidance wants everything, since
+        an unrecognised object is still something to not drive into.
+        Returns None on failure rather than raising - the caller is a control
+        loop and needs to stop, not crash.
+        """
+        if not self.load():
+            return None
+        try:
+            import base64
+
+            import numpy as np
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(base64.b64decode(jpeg_b64))).convert("RGB")
+            x = np.asarray(img.resize((300, 300)), dtype=np.uint8)[None, ...]
+            started = time.monotonic()
+            boxes, classes, scores, _ = self._session.run(
+                None, {self._input.name: x})
+            self.last_ms = (time.monotonic() - started) * 1000
+            return boxes[0], classes[0], scores[0]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("detection failed: %s", exc)
+            return None
+
     def detect(self, jpeg_b64: str, max_people: int = 4) -> list[Person]:
         """Find people in a base64 JPEG. Returns [] on any failure."""
         if not self.load():

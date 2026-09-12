@@ -23,7 +23,7 @@ from collections import deque
 from . import config as cfg_mod
 from .audio import Transcriber, VoiceListener, match_wake_word
 from .board import BoardReader
-from .camera import build_camera
+from .camera import auto_expose, build_camera
 from .codegen import BehaviorRunner, BehaviorStore, BehaviorWriter
 from .console import Console
 from .control import KILL_EXIT_CODE, classify
@@ -546,12 +546,28 @@ class Loop:
             if v is not None and v.available:
                 proc = getattr(v, "_proc", None)
                 if proc is not None and proc.poll() is not None:
+                    # DISARM FIRST. "Hank halt" is the primary way to stop him,
+                    # and it runs on this microphone. Losing it silently left
+                    # him armed and deaf, which is exactly the situation the
+                    # stop word exists to prevent.
+                    if self.guard.status().get("motion_enabled"):
+                        log.warning("[peripherals] MICROPHONE LOST - disarming motion")
+                        self.guard.enable(False)
+                        self.guard.stop()
+                        if self.console:
+                            self.console.event(
+                                "err", "microphone lost - motion disarmed "
+                                       "(the stop word needs a mic)")
+                        self.say("I have lost my microphone, so I have turned "
+                                 "my motors off. I cannot hear you stop me.")
                     log.info("[peripherals] microphone went away - reopening")
                     try:
                         v.stop()
                         v.start()
                         await asyncio.to_thread(v.calibrate)
                         log.info("[peripherals] microphone back")
+                        if self.console:
+                            self.console.event("agent", "microphone back")
                     except Exception as exc:  # noqa: BLE001
                         log.debug("mic reopen failed: %s", exc)
 
@@ -657,6 +673,11 @@ class Loop:
 
     async def run(self) -> None:
         if not self.static_image_b64:
+            # Before anything looks at a frame: the camera defaults to gain 0
+            # and in a dim room produces near-black images that defeat both the
+            # detector and the vision model.
+            if self.cfg.camera.auto_expose:
+                await asyncio.to_thread(auto_expose, self.cfg.camera.device)
             self.camera.start()
         ok = await self.vlm.available()
         if not ok:
