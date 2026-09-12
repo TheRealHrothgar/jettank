@@ -516,6 +516,9 @@ class ToolBox:
     # ---- implementations ----
     def _t_get_status(self) -> dict:
         st = {"ok": True, **self._guard.status()}
+        board = getattr(self._loop, "board", None)
+        if board is not None:
+            st.update(board.status())
         st["recent_observations"] = list(self._loop.observations)[-5:]
         st["camera"] = getattr(self._camera, "_device", "unknown")
         st["enrolled_faces"] = self._faces.list_names() if self._faces else []

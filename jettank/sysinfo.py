@@ -84,6 +84,8 @@ def collect(loop=None) -> dict:
         facts["speech_out"] = getattr(getattr(loop, "speaker", None), "_engine", None) or "none"
         facts["camera"] = loop.cfg.camera.device
         facts["camera_resolution"] = f"{loop.cam_width}x{loop.cam_height}"
+        board = getattr(loop, "board", None)
+        facts["board"] = board.status() if board is not None else {}
     return facts
 
 
@@ -150,6 +152,14 @@ def describe(facts: dict) -> str:
     disk = facts.get("disk", {})
     if disk.get("free_gb"):
         lines.append(f"- {disk['free_gb']} GB of disk free.")
+
+    board = facts.get("board") or {}
+    if board.get("board") == "connected":
+        lines.append(
+            f"- You can feel your own chassis: battery {board.get('battery_v')} volts, "
+            f"and an accelerometer that tells you whether you are level and whether "
+            f"you are physically moving. If someone asks your battery, read it from "
+            f"your status rather than guessing.")
 
     lines.append(
         "- Two spoken controls override you and never reach you: 'Hank halt' "

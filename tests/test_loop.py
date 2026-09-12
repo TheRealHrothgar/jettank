@@ -420,6 +420,56 @@ v3._proc = FakeMic("q" * 60)
 v3.calibrate(1.0)
 check("a quiet room never lowers the gate", v3.threshold == 0.05, str(v3.threshold))
 
+# ---------- expansion board protocol ----------
+print("\nExpansion board (verified against real hardware)")
+from jettank.board import (DEVICE_ID, checksum, decode_telemetry,  # noqa: E402
+                           encode, parse)
+
+# A real frame captured from the board, with the robot sitting still and level.
+REAL = bytes.fromhex("fffd130800000078fbccffbc40d6ff250000007ac9")
+check("a real captured frame is 21 bytes", len(REAL) == 21, str(len(REAL)))
+check("device id is 0xFD, not the vendor's 0xFC", REAL[1] == DEVICE_ID == 0xFD)
+check("checksum is a plain sum, no complement", checksum(REAL[:-1]) == REAL[-1],
+      "%02x vs %02x" % (checksum(REAL[:-1]), REAL[-1]))
+
+# The vendor library's rule must NOT validate - that mismatch is the finding.
+vendor = (sum(REAL[2:-1]) + 257 - 0xFC) & 0xFF
+check("the vendor library's checksum rule does not validate here",
+      vendor != REAL[-1])
+
+frames, rest = parse(bytearray(REAL))
+check("a real frame parses", len(frames) == 1 and rest == b"", str(frames))
+check("its function is 0x08", frames[0][0] == 0x08)
+
+t = decode_telemetry(frames[0][1])
+check("telemetry decodes", t is not None)
+check("it reads roughly 1g upright", 0.9 <= t.accel_g[2] <= 1.1, str(t.accel_g))
+check("it is not tilted", t.tilt_g < 0.2, str(t.tilt_g))
+check("it is stationary", t.moving is False, str(t.gyro))
+check("gyro decodes to near zero", max(abs(g) for g in t.gyro) < 100, str(t.gyro))
+check("battery reads 12.2V", t.battery_v == 12.2, str(t.battery_v))
+
+# framing survives a dirty stream
+noisy = bytearray(b"\x00\xff\x12" + REAL + REAL)
+frames, _ = parse(noisy)
+check("framing recovers from leading noise", len(frames) == 2, str(len(frames)))
+
+bad = bytearray(REAL); bad[-1] ^= 0xFF
+frames, _ = parse(bad)
+check("a corrupt frame is dropped, not decoded", frames == [], str(frames))
+check("a truncated frame is held back", parse(bytearray(REAL[:-3]))[0] == [])
+
+# encode round-trips through our own parser
+enc = encode(0x08, REAL[4:-1])
+check("encode round-trips", enc == REAL, enc.hex())
+check("encode computes a valid checksum", checksum(enc[:-1]) == enc[-1])
+
+# There must be no way to make this module transmit.
+import jettank.board as _board  # noqa: E402
+src = (ROOT / "jettank" / "board.py").read_text()
+check("the board module never writes to the port",
+      ".write(" not in src, "board.py contains a write call")
+
 # ---------- control words ----------
 print("\nControl words (Hank Halt / Hank Override)")
 from jettank.control import KILL_EXIT_CODE, KILL_PHRASES, classify, normalise  # noqa: E402

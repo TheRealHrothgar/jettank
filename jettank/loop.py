@@ -22,6 +22,7 @@ from collections import deque
 
 from . import config as cfg_mod
 from .audio import Transcriber, VoiceListener, match_wake_word
+from .board import BoardReader
 from .camera import build_camera
 from .codegen import BehaviorRunner, BehaviorStore, BehaviorWriter
 from .console import Console
@@ -60,6 +61,11 @@ class Loop:
             cfg.cloud.api_key, cfg.cloud.timeout_s, cfg.cloud.max_tokens,
         )
         self.robot = build_robot()
+        # Read-only telemetry from the expansion board: battery, tilt, whether
+        # the chassis is actually moving. Independent of the motion path, which
+        # stays dry-run - this only listens.
+        self.board = BoardReader()
+        self.board.start()
 
         # Everything the cloud agent is allowed to touch goes through here.
         # Motion starts disabled: MotionGuard.enable() is a local-operator
@@ -512,6 +518,7 @@ class Loop:
                     await t
             if self.console is not None:
                 self.console.stop()
+            self.board.stop()
             self.guard.close()
             self.robot.stop()
             if not self.static_image_b64:
