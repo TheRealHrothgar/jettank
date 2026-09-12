@@ -9,11 +9,25 @@ Design rules:
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import shutil
 import subprocess
+import threading
+import time
+from pathlib import Path
 from typing import Any, Callable
 
 log = logging.getLogger(__name__)
+
+
+def _piper_ready() -> bool:
+    try:
+        import piper  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 # ---- schemas (Anthropic tool-use format) ----
 
@@ -203,24 +217,131 @@ class ToolBox:
 
 
 class Speaker:
-    """Text to speech through the robot's ALSA device, with a graceful fallback."""
+    """Text to speech, best available engine first.
 
-    def __init__(self, device: str = "default") -> None:
-        self._device = device
-        self._engine = None
-        for cand in ("espeak-ng", "espeak"):
-            if subprocess.run(["which", cand], capture_output=True).returncode == 0:
-                self._engine = cand
-                break
+    piper     - neural, offline, runs fine on the Orin's CPU. Sounds human.
+    espeak-ng - formant synth from the 1980s. Always available, sounds it.
+                Kept only so a missing voice model degrades to *something*.
+
+    Audio is rendered to a WAV on stdout and piped into `aplay -D`, rather
+    than letting the engine choose an output: on JetPack the ALSA default is a
+    Tegra APE virtual card, and relying on it is how a robot talks into a void.
+    """
+
+    def __init__(self, device: str = "auto", voice: str | None = None) -> None:
+        from .audio import pick_speaker
+
+        self._device = pick_speaker(device)
+        self._engine: str | None = None
+        self._piper_voice = self._find_voice(voice)
+
+        self._voice = None          # loaded lazily; see _load_piper
+        self._voice_lock = threading.Lock()
+        if self._piper_voice and _piper_ready():
+            self._engine = "piper"
+        else:
+            for cand in ("espeak-ng", "espeak"):
+                if shutil.which(cand):
+                    self._engine = cand
+                    break
+        log.info("speech: %s%s", self._engine or "none",
+                 f" ({Path(self._piper_voice).stem})" if self._engine == "piper" else "")
+        if self._engine == "piper":
+            # Load the voice off the critical path so the first thing Hank
+            # says is not two seconds late.
+            threading.Thread(target=self._warm, name="tts-warm", daemon=True).start()
+
+    def _warm(self) -> None:
+        try:
+            self._load_piper()
+        except Exception as exc:  # noqa: BLE001 - fall back at speak time
+            log.warning("could not preload voice (%s)", exc)
+
+    @staticmethod
+    def _find_voice(voice: str | None) -> str | None:
+        """Locate a Piper .onnx voice: explicit path, env, then the voices dir."""
+        cand = voice or os.environ.get("JETTANK_TTS_VOICE", "")
+        if cand and Path(cand).exists():
+            return cand
+        vdir = Path(__file__).resolve().parent.parent / "voices"
+        if cand:
+            named = vdir / f"{cand}.onnx"
+            if named.exists():
+                return str(named)
+            log.warning("voice %r not found in %s", cand, vdir)
+        found = sorted(vdir.glob("*.onnx")) if vdir.is_dir() else []
+        return str(found[0]) if found else None
+
+    def _load_piper(self):
+        """Load the voice once and keep it.
+
+        Shelling out to `python -m piper` costs ~2.5s per utterance, almost all
+        of it importing onnxruntime and re-reading the 61MB model - far more
+        than the synthesis itself (RTF ~0.1). Held in-process, the same call
+        starts speaking in well under a second.
+        """
+        with self._voice_lock:
+            if self._voice is None:
+                from piper import PiperVoice
+
+                t = time.monotonic()
+                self._voice = PiperVoice.load(self._piper_voice)
+                log.info("loaded voice %s in %.1fs",
+                         Path(self._piper_voice).stem, time.monotonic() - t)
+            return self._voice
+
+    def _speak_piper(self, text: str) -> dict:
+        """Synthesise and play as chunks arrive, so speech starts immediately."""
+        voice = self._load_piper()
+        proc = None
+        played = 0
+        try:
+            for chunk in voice.synthesize(text):
+                pcm = getattr(chunk, "audio_int16_bytes", None)
+                if pcm is None:  # older piper returned raw arrays
+                    pcm = bytes(chunk.audio_int16_array)
+                if proc is None:
+                    proc = subprocess.Popen(
+                        ["aplay", "-q", "-D", self._device, "-f", "S16_LE",
+                         "-r", str(getattr(chunk, "sample_rate", 22050)),
+                         "-c", str(getattr(chunk, "sample_channels", 1)), "-t", "raw", "-"],
+                        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                proc.stdin.write(pcm)
+                played += len(pcm)
+        finally:
+            if proc is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    proc.stdin.close()
+                proc.wait(timeout=120)
+        if not played:
+            return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
+        return {"ok": True, "spoken_text": text}
+
+    def _render(self, text: str) -> bytes:
+        """WAV bytes from the fallback engine."""
+        return subprocess.run([self._engine, "--stdout", text],
+                              capture_output=True, timeout=30).stdout
 
     def say(self, text: str) -> dict:
         if self._engine is None:
             log.info("[speak] %s", text)
-            return {"ok": False, "error": "no TTS engine installed (apt install espeak-ng)",
+            return {"ok": False, "error": "no TTS engine available (pip install piper-tts, or apt install espeak-ng)",
                     "spoken_text": text}
         try:
-            subprocess.run([self._engine, text], timeout=30, check=False,
+            if self._engine == "piper":
+                return self._speak_piper(text)
+            wav = self._render(text)
+            if not wav:
+                return {"ok": False, "error": "TTS produced no audio",
+                        "spoken_text": text}
+            subprocess.run(["aplay", "-q", "-D", self._device], input=wav,
+                           timeout=60, check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return {"ok": True, "spoken_text": text}
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": "TTS timed out", "spoken_text": text}
+        except FileNotFoundError as exc:
+            return {"ok": False, "error": f"audio playback unavailable: {exc}",
+                    "spoken_text": text}

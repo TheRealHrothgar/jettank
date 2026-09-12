@@ -232,18 +232,65 @@ export JETTANK_WHISPER_BIN=/opt/whisper.cpp/build/bin/whisper-cli
 export JETTANK_WHISPER_MODEL=/opt/whisper.cpp/models/ggml-base.en.bin
 ```
 
-Text-to-speech is `espeak-ng` (`sudo apt install espeak-ng`). The mic is muted
-while the robot speaks, or it transcribes itself and talks in a loop.
+Text-to-speech is **Piper** — neural, offline, and it does not sound like a
+1980s formant synth (which is exactly what the `espeak-ng` fallback is):
+
+```bash
+~/jettank/.venv/bin/pip install piper-tts
+mkdir -p ~/jettank/voices && cd ~/jettank/voices
+B=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium
+curl -sSLO $B/en_US-ryan-medium.onnx -O $B/en_US-ryan-medium.onnx.json
+```
+
+Set `JETTANK_TTS_VOICE=en_US-ryan-medium`; any `.onnx` in `voices/` is used
+otherwise. The mic is muted while the robot speaks, or it transcribes itself
+and talks in a loop.
+
+**Do not shell out to `python -m piper` per utterance.** That costs ~2.5 s
+every time, almost all of it importing onnxruntime and re-reading the 61 MB
+model — synthesis itself is only ~0.1x realtime. The voice is loaded once
+in-process, warmed on a background thread at startup, and audio is streamed to
+`aplay` chunk by chunk so speech begins before synthesis has finished.
 
 ```bash
 python3 -m jettank.loop --voice
 ```
 
-Utterances are segmented by an energy gate, not a neural VAD — cheap and good
-enough at arm's length. If the Jetson's own fan keeps triggering it, raise
-`JETTANK_MIC_THRESHOLD` (default 0.02). Only speech after the wake word
-(`JETTANK_WAKE_WORD`, default `hey tank`) becomes a command; set it empty for
+#### Audio traps on this board, all of which cost us a round
+
+* **Never use ALSA `default` for capture.** On JetPack it resolves to a Tegra
+  APE virtual card that opens happily and returns **digital silence forever** —
+  no error, no warning. `pick_mic()` scans `arecord -l` and skips anything
+  named APE/ADMAIF/HDA. Playback on `default` happens to work; capture does
+  not. Verify with `arecord -D plughw:0,0 ... && aplay` and check the RMS is
+  non-zero, not just that the file exists.
+* **Discard the first ~1.2 s.** `arecord` and the speakerphone's AGC both
+  settle over the first second and emit a transient that wrecks calibration.
+* **Energy gating does not work on this mic.** The USB speakerphone has
+  hardware AGC and noise suppression, so it *normalises levels*. Measured on
+  the bench: speech sat only 2.2x above silence, and the silence p90 was
+  **above** the speech median. Any fixed threshold either swallows quiet
+  speech or trips constantly. We use **Silero VAD** (ships inside
+  faster-whisper) which keys on spectral shape, not loudness. The energy gate
+  survives only as a fallback when Silero is missing.
+* **Keep a pre-roll buffer.** Any gate opens partway into the first syllable,
+  and the first word is the wake word — the one word you cannot afford to
+  clip. We keep 400 ms of audio from *before* the gate opened and prepend it.
+  Symptom without it: "hey hank, what do you see" transcribes as "What do you
+  see?" and is silently ignored.
+* **People pause after the wake word.** VAD correctly ends the utterance on
+  "hey Hank" alone. So a bare wake word opens a listening window
+  (`JETTANK_FOLLOW_UP`, 12 s) during which the next utterance needs no wake
+  word — which also makes follow-up questions feel natural.
+
+Wake word is `JETTANK_WAKE_WORD` (default `hey hank`); set it empty for
 always-on, which you probably don't want in a shared room.
+
+STT runs on **CPU**: the arm64 `ctranslate2` wheel is built without CUDA
+(`ValueError: This CTranslate2 package was not compiled with CUDA support`).
+`base.en` transcribes a 3 s utterance in ~1.4 s, which is fine for
+wake-word-gated commands. Building CTranslate2 with CUDA, or using whisper.cpp,
+is the upgrade path if you want a larger model.
 
 ### Browser console (visual)
 

@@ -89,15 +89,22 @@ class VoiceConfig:
     resulting text reaches the cloud agent."""
 
     enabled: bool = field(default_factory=lambda: _env_b("JETTANK_VOICE", False))
-    mic: str = field(default_factory=lambda: _env("JETTANK_MIC", "default"))
+    # "auto" finds the USB capture card. Do NOT use "default": on JetPack that
+    # is a Tegra APE virtual card that returns silence forever.
+    mic: str = field(default_factory=lambda: _env("JETTANK_MIC", "auto"))
     stt_backend: str = field(default_factory=lambda: _env("JETTANK_STT_BACKEND", "auto"))
     stt_model: str = field(default_factory=lambda: _env("JETTANK_STT_MODEL", "base.en"))
     # Empty means always-on: every utterance becomes a command. A wake word is
     # strongly preferred on a robot that is also listening to a room.
-    wake_word: str = field(default_factory=lambda: _env("JETTANK_WAKE_WORD", "hey tank"))
+    wake_word: str = field(default_factory=lambda: _env("JETTANK_WAKE_WORD", "hey hank"))
     # Energy gate, 0..1. Raise it if the robot's own fans keep triggering it.
     threshold: float = field(default_factory=lambda: _env_f("JETTANK_MIC_THRESHOLD", 0.02))
-    silence_ms: int = field(default_factory=lambda: _env_i("JETTANK_MIC_SILENCE_MS", 700))
+    # Silero needs a real pause to call end-of-utterance. Too short and it
+    # splits mid-sentence; too long and the robot feels sluggish.
+    silence_ms: int = field(default_factory=lambda: _env_i("JETTANK_MIC_SILENCE_MS", 900))
+    # After the wake word (or a reply), accept the next utterance without
+    # needing the wake word again, so conversation flows.
+    follow_up_s: float = field(default_factory=lambda: _env_f("JETTANK_FOLLOW_UP", 12.0))
 
 
 @dataclass(frozen=True)

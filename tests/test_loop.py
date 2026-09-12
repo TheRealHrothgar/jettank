@@ -355,6 +355,102 @@ check("silence reads as near-zero rms", _rms(b"\x00\x00" * 100) < 0.001)
 check("loud audio reads high", _rms(b"\x00\x40" * 100) > 0.4)
 check("empty buffer is safe", _rms(b"") == 0.0)
 
+# ---------- utterance segmentation keeps the wake word ----------
+print("\nPre-roll (wake word must survive the gate)")
+import io  # noqa: E402
+from jettank.audio import CHUNK_BYTES, VoiceListener  # noqa: E402
+
+
+class FakeMic:
+    """Feeds a scripted PCM stream through the same read() the real mic uses."""
+
+    def __init__(self, pattern):
+        loud = (b"\x00\x40" * (CHUNK_BYTES // 2))
+        quiet = b"\x00\x00" * (CHUNK_BYTES // 2)
+        self.stdout = io.BytesIO(b"".join(loud if c == "L" else quiet for c in pattern))
+
+
+def listener(pattern, **kw):
+    v = VoiceListener.__new__(VoiceListener)
+    VoiceListener.__init__(v, device="plughw:0,0",
+                           transcriber=type("T", (), {"available": True,
+                                                      "backend": "fake",
+                                                      "transcribe": lambda s, p: "x"})(),
+                           **kw)
+    v._proc = FakeMic(pattern)
+    captured = {}
+    v._transcribe = lambda pcm: captured.setdefault("chunks", len(pcm) // CHUNK_BYTES)
+    v.next_utterance()
+    return captured.get("chunks", 0)
+
+
+# 10 quiet chunks, then speech: the gate opens on the first loud chunk, but the
+# preceding quiet chunks (the clipped onset) must be prepended.
+n = listener("q" * 10 + "L" * 20 + "q" * 30, preroll_ms=300, silence_ms=300,
+             min_speech_ms=100, threshold=0.1)
+check("captured audio includes pre-roll", n > 20, f"got {n} chunks, expected >20")
+check("pre-roll is bounded", n <= 20 + 10 + 10, f"got {n} chunks")
+
+n0 = listener("q" * 10 + "L" * 20 + "q" * 30, preroll_ms=0, silence_ms=300,
+              min_speech_ms=100, threshold=0.1)
+check("without pre-roll the onset is lost", n0 < n, f"preroll={n} none={n0}")
+
+# calibration must not gate out normal speech
+v2 = VoiceListener.__new__(VoiceListener)
+VoiceListener.__init__(v2, device="plughw:0,0",
+                       transcriber=type("T", (), {"available": True, "backend": "f"})(),
+                       threshold=0.02)
+v2._proc = FakeMic("L" * 60)
+v2.calibrate(1.0)
+check("calibration raises the gate above the floor", v2.threshold > 0.02)
+check("calibration is capped below speech level", v2.threshold <= 0.12, str(v2.threshold))
+
+v3 = VoiceListener.__new__(VoiceListener)
+VoiceListener.__init__(v3, device="plughw:0,0",
+                       transcriber=type("T", (), {"available": True, "backend": "f"})(),
+                       threshold=0.05)
+v3._proc = FakeMic("q" * 60)
+v3.calibrate(1.0)
+check("a quiet room never lowers the gate", v3.threshold == 0.05, str(v3.threshold))
+
+# ---------- wake window ----------
+print("\nWake window (pause after the wake word)")
+
+
+def conversation(utterances, wake="hey hank", follow_up=12.0, now=None):
+    """Replay utterances through the same decision logic listen_forever uses."""
+    acted, open_until, t = [], 0.0, 0.0
+    for text, dt in utterances:
+        t += dt
+        command = match_wake_word(text, wake)
+        listening = t < open_until
+        if command is None:
+            if not listening:
+                continue
+            command = text.strip()
+        if not command:
+            open_until = t + follow_up
+            continue
+        acted.append(command)
+        open_until = t + follow_up
+    return acted
+
+
+check("bare wake word alone acts on nothing",
+      conversation([("hey hank", 0)]) == [])
+check("wake word then a pause still gets the command",
+      conversation([("hey hank", 0), ("what do you see", 2)]) == ["what do you see"])
+check("one-breath command works too",
+      conversation([("hey hank what do you see", 0)]) == ["what do you see"])
+check("follow-up needs no wake word",
+      conversation([("hey hank", 0), ("what do you see", 2), ("now look left", 3)])
+      == ["what do you see", "now look left"])
+check("speech after the window closes is ignored",
+      conversation([("hey hank", 0), ("what do you see", 2), ("unrelated chatter", 60)])
+      == ["what do you see"])
+check("cold chatter is never acted on",
+      conversation([("so anyway I told him", 0), ("and then we left", 1)]) == [])
+
 # ---------- console ----------
 print("\nConsole")
 from jettank.console import Console  # noqa: E402

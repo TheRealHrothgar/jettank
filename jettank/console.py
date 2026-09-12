@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger(__name__)
 
-PAGE = """<!doctype html><meta charset=utf-8><title>Jettank console</title>
+PAGE = """<!doctype html><meta charset=utf-8><title>Hank the Tank</title>
 <style>
  body{background:#111;color:#ddd;font:14px/1.45 ui-monospace,Menlo,monospace;margin:0;padding:16px}
  h1{font-size:15px;font-weight:600;margin:0 0 12px;color:#8fd}
@@ -37,12 +37,12 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Jettank console</title>
  button.stop{background:#611;border-color:#a33;color:#fdd}
  #stat{margin-top:10px;color:#999}
 </style>
-<h1>jettank console</h1>
+<h1>hank the tank &mdash; console</h1>
 <div class=wrap>
   <div><img id=cam src="/stream.mjpg" alt="camera"></div>
   <div class=col>
     <div id=log></div>
-    <form id=f><input type=text id=cmd placeholder="tell the robot something..." autocomplete=off autofocus></form>
+    <form id=f><input type=text id=cmd placeholder="tell Hank something..." autocomplete=off autofocus></form>
     <button type=button onclick="act('estop')" class=stop>E-STOP</button>
     <button type=button onclick="act('arm')">arm motion</button>
     <button type=button onclick="act('disarm')">disarm</button>
@@ -57,7 +57,7 @@ async function act(a){const r=await fetch('/api/'+a,{method:'POST'});line('agent
 document.getElementById('f').onsubmit=async e=>{e.preventDefault();
   const i=document.getElementById('cmd'),t=i.value.trim();if(!t)return;i.value='';line('hear','you: '+t);
   const r=await fetch('/api/command',{method:'POST',body:JSON.stringify({text:t})});
-  const j=await r.json();line(j.ok?'agent':'err','robot: '+(j.reply||j.error));};
+  const j=await r.json();line(j.ok?'agent':'err','hank: '+(j.reply||j.error));};
 let seen=0;
 setInterval(async()=>{const s=await (await fetch('/api/state')).json();
   document.getElementById('stat').textContent=
@@ -122,7 +122,7 @@ class Console:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         reply = result.get("reply", "")
-        self.event("agent", f"robot: {reply}")
+        self.event("agent", f"hank: {reply}")
         return {"ok": True, "reply": reply}
 
     def control(self, action: str) -> str:

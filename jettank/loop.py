@@ -237,8 +237,15 @@ class Loop:
             log.warning("voice enabled but no mic/STT backend - voice control disabled")
             return
         v.start()
+        await asyncio.to_thread(v.calibrate)
         wake = self.cfg.voice.wake_word
         log.info("voice control ready (wake word: %r)", wake or "<always on>")
+        # People say "hey Hank" and then *pause* before the actual request, so
+        # VAD correctly ends the utterance on the wake word alone. Rather than
+        # fight that, a wake word opens a window during which the next thing
+        # said is taken as the command. The window also stays open briefly
+        # after a reply, so a follow-up does not need the wake word again.
+        open_until = 0.0
         try:
             while not self._stop.is_set():
                 text = await asyncio.to_thread(v.next_utterance)
@@ -247,15 +254,23 @@ class Loop:
                 log.info("[hear] %s", text)
                 if self.console:
                     self.console.event("hear", f"heard: {text}")
+
                 command = match_wake_word(text, wake)
+                listening = time.monotonic() < open_until
                 if command is None:
-                    self.transcript.append({"heard": text, "acted": False})
-                    continue
+                    if not listening:
+                        self.transcript.append({"heard": text, "acted": False})
+                        continue
+                    command = text.strip()  # inside the window: no wake word needed
                 if not command:
+                    open_until = time.monotonic() + self.cfg.voice.follow_up_s
                     self.say("I'm listening.")
                     continue
+
                 self.transcript.append({"heard": text, "acted": True})
+                open_until = 0.0
                 await self.instruct(command)
+                open_until = time.monotonic() + self.cfg.voice.follow_up_s
         finally:
             v.stop()
 

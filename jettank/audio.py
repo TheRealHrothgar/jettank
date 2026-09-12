@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import array
 import logging
+import collections
 import math
 import os
 import shutil
@@ -34,6 +35,54 @@ SAMPLE_BYTES = 2      # s16le
 CHUNK_MS = 30
 CHUNK_FRAMES = RATE * CHUNK_MS // 1000
 CHUNK_BYTES = CHUNK_FRAMES * CHANNELS * SAMPLE_BYTES
+WARMUP_MS = 1200      # arecord + AGC settling; the levels here are garbage
+
+
+def pick_mic(preferred: str = "auto") -> str:
+    """Find the USB microphone's ALSA name.
+
+    Do not trust `default`. On JetPack the default capture device is one of the
+    Tegra APE virtual cards, which opens happily and returns *digital silence*
+    forever - no error, no warning, just a mic that never hears anything. The
+    USB capture card is the one we want, addressed as plughw:<card>,0 so ALSA
+    handles any rate conversion.
+    """
+    if preferred and preferred != "auto":
+        return preferred
+    return _pick("arecord", "microphone")
+
+
+def _pick(tool: str, what: str) -> str:
+    try:
+        out = subprocess.run([tool, "-l"], capture_output=True, text=True,
+                             timeout=10).stdout
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not enumerate %s devices (%s)", what, exc)
+        return "default"
+    for line in out.splitlines():
+        if not line.startswith("card "):
+            continue
+        # "card 0: Phone [USB Speaker Phone], device 0: USB Audio [USB Audio]"
+        if "APE" in line or "ADMAIF" in line or "HDA" in line:
+            continue
+        try:
+            card = line.split()[1].rstrip(":")
+            dev = line.split("device ")[1].split(":")[0].strip()
+        except (IndexError, ValueError):
+            continue
+        name = f"plughw:{card},{dev}"
+        log.info("%s: %s (%s)", what, name, line.split("[")[1].split("]")[0])
+        return name
+    log.warning("no USB %s found; falling back to 'default', which on this "
+                "board may be silent", what)
+    return "default"
+
+
+def pick_speaker(preferred: str = "auto") -> str:
+    """Find the USB speaker's ALSA name, same reasoning as pick_mic()."""
+    if preferred and preferred != "auto":
+        return preferred
+    return _pick("aplay", "speaker")
 
 
 def _rms(buf: bytes) -> float:
@@ -123,6 +172,47 @@ class Transcriber:
             return ""
 
 
+class SpeechDetector:
+    """Neural voice-activity detection (Silero, shipped with faster-whisper).
+
+    An energy gate cannot segment this robot's audio. The USB speakerphone has
+    hardware AGC and noise suppression, so it normalises levels: measured on
+    the bench, speech sat only 2.2x above silence and the silence p90 was
+    *above* the speech median. Any fixed threshold either swallows quiet speech
+    or trips constantly on fan noise. Silero looks at spectral shape instead of
+    loudness, which AGC does not flatten.
+    """
+
+    def __init__(self) -> None:
+        self._vad = None
+        self._np = None
+        try:
+            import numpy as np
+
+            from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+            self._np = np
+            self._get = get_speech_timestamps
+            self._opts = VadOptions
+            self._vad = True
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Silero VAD unavailable (%s); falling back to energy gate", exc)
+
+    @property
+    def available(self) -> bool:
+        return bool(self._vad)
+
+    def speech_regions(self, pcm: bytes, min_silence_ms: int) -> list[dict]:
+        """Return [{'start': sample, 'end': sample}] for speech in `pcm`."""
+        audio = self._np.frombuffer(pcm, dtype=self._np.int16).astype("float32") / 32768.0
+        return self._get(audio, self._opts(
+            threshold=0.5,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=min_silence_ms,
+            speech_pad_ms=200,
+        ))
+
+
 # ---------------------------------------------------------------- capture
 
 class VoiceListener:
@@ -133,17 +223,27 @@ class VoiceListener:
     VAD cleans up whatever slips through.
     """
 
-    def __init__(self, device: str = "default", transcriber: Transcriber | None = None,
+    def __init__(self, device: str = "auto", transcriber: Transcriber | None = None,
                  threshold: float = 0.02, silence_ms: int = 700,
-                 min_speech_ms: int = 400, max_utterance_s: float = 15.0) -> None:
-        self.device = device
+                 min_speech_ms: int = 400, max_utterance_s: float = 15.0,
+                 preroll_ms: int = 400) -> None:
+        self.device = pick_mic(device)
         self.stt = transcriber or Transcriber()
         self.threshold = threshold
+        self._silence_ms = silence_ms
         self._silence_chunks = max(1, silence_ms // CHUNK_MS)
         self._min_chunks = max(1, min_speech_ms // CHUNK_MS)
         self._max_chunks = int(max_utterance_s * 1000) // CHUNK_MS
+        # Audio from *before* the gate opened. An energy gate necessarily
+        # triggers partway into the first syllable, and the first word is the
+        # wake word - the one word we cannot afford to clip. So keep a rolling
+        # buffer and prepend it when speech starts.
+        self._preroll: collections.deque[bytes] = collections.deque(
+            maxlen=max(1, preroll_ms // CHUNK_MS))
         self._proc: subprocess.Popen | None = None
         self._muted = False
+        self._detector = SpeechDetector()
+        self._max_bytes = int(max_utterance_s * 1000) // CHUNK_MS * CHUNK_BYTES
 
     @property
     def available(self) -> bool:
@@ -161,7 +261,17 @@ class VoiceListener:
              "-c", str(CHANNELS), "-t", "raw", "-q"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        # arecord and the speakerphone's AGC both settle over the first second
+        # and emit a transient that calibration and VAD would both misread.
+        self._discard(WARMUP_MS)
         log.info("listening on %s (backend %s)", self.device, self.stt.backend)
+
+    def _discard(self, ms: int) -> None:
+        if self._proc is None or self._proc.stdout is None:
+            return
+        for _ in range(max(0, ms // CHUNK_MS)):
+            if not self._proc.stdout.read(CHUNK_BYTES):
+                return
 
     def stop(self) -> None:
         if self._proc is None:
@@ -173,6 +283,35 @@ class VoiceListener:
             self._proc.kill()
         self._proc = None
 
+    def calibrate(self, seconds: float = 1.5) -> float:
+        """Measure the room + fan noise floor and lift the gate above it.
+
+        The Jetson's fan and the USB speakerphone's own preamp put the floor
+        around 0.005-0.02 depending on power mode, which is right on top of a
+        fixed threshold. Measuring beats guessing, but never let calibration
+        *lower* the gate below the configured value - a loud room should make
+        the robot harder to trigger, not easier.
+        """
+        if self._proc is None or self._proc.stdout is None:
+            return self.threshold
+        peak = 0.0
+        for _ in range(max(1, int(seconds * 1000) // CHUNK_MS)):
+            chunk = self._proc.stdout.read(CHUNK_BYTES)
+            if not chunk or len(chunk) < CHUNK_BYTES:
+                break
+            peak = max(peak, _rms(chunk))
+        # 3x an already-high floor puts the gate above conversational speech.
+        # 1.6x with a ceiling keeps quiet talkers audible.
+        floor = round(min(peak * 1.6, 0.12), 4)
+        if floor > self.threshold:
+            log.info("noise floor %.4f - raising speech gate %.4f -> %.4f",
+                     peak, self.threshold, floor)
+            self.threshold = floor
+        else:
+            log.info("noise floor %.4f - keeping speech gate at %.4f",
+                     peak, self.threshold)
+        return self.threshold
+
     def next_utterance(self) -> str:
         """Block until one utterance has been captured and transcribed.
 
@@ -181,6 +320,45 @@ class VoiceListener:
         """
         if self._proc is None or self._proc.stdout is None:
             return ""
+        if self._detector.available:
+            return self._next_vad()
+        return self._next_energy()
+
+    def _next_vad(self) -> str:
+        """Accumulate audio and cut when Silero says the speaker has finished."""
+        buf = bytearray()
+        while True:
+            chunk = self._proc.stdout.read(CHUNK_BYTES)
+            if not chunk or len(chunk) < CHUNK_BYTES:
+                return ""
+            if self._muted:
+                buf.clear()
+                continue
+            buf.extend(chunk)
+            # Only re-run VAD every ~300ms; it is cheap but not free.
+            if len(buf) % (CHUNK_BYTES * 10) or len(buf) < CHUNK_BYTES * 20:
+                if len(buf) < self._max_bytes:
+                    continue
+            try:
+                regions = self._detector.speech_regions(bytes(buf), self._silence_ms)
+            except Exception as exc:  # noqa: BLE001 - never let VAD kill the loop
+                log.warning("VAD failed (%s); using energy gate this round", exc)
+                return self._next_energy()
+
+            if not regions:
+                # Nothing but noise. Keep a tail in case speech just started.
+                if len(buf) > CHUNK_BYTES * 100:
+                    del buf[:-CHUNK_BYTES * 20]
+                continue
+
+            end = regions[-1]["end"] * SAMPLE_BYTES
+            trailing_ms = (len(buf) - end) // (CHUNK_BYTES // CHUNK_MS)
+            if trailing_ms >= self._silence_ms or len(buf) >= self._max_bytes:
+                start = regions[0]["start"] * SAMPLE_BYTES
+                return self._transcribe(bytes(buf[start:end]))
+
+    def _next_energy(self) -> str:
+        """Fallback segmenter for when Silero is not installed."""
         speech: list[bytes] = []
         quiet = 0
         while True:
@@ -189,21 +367,28 @@ class VoiceListener:
                 return ""  # mic went away; caller decides whether to restart
             if self._muted:
                 speech.clear()
+                self._preroll.clear()
                 quiet = 0
                 continue
             loud = _rms(chunk) >= self.threshold
             if loud:
+                if not speech:
+                    speech.extend(self._preroll)  # recover the clipped onset
+                    self._preroll.clear()
                 speech.append(chunk)
                 quiet = 0
-            elif speech:
+            elif not speech:
+                self._preroll.append(chunk)
+            else:
                 speech.append(chunk)
                 quiet += 1
                 if quiet >= self._silence_chunks:
                     break
             if len(speech) >= self._max_chunks:
                 break
-        if len(speech) < self._min_chunks + self._silence_chunks:
+        if len(speech) < self._min_chunks + self._silence_chunks + len(self._preroll):
             return ""
+        self._preroll.clear()
         return self._transcribe(b"".join(speech))
 
     def _transcribe(self, pcm: bytes) -> str:
