@@ -45,20 +45,21 @@ class NullRobot:
 
 
 def build() -> RobotDriver:
-    """Return the best available driver. Falls back to NullRobot.
+    """Return the best available driver, falling back to NullRobot.
 
-    The Yahboom driver starts in dry-run: it encodes and logs frames but does
-    not transmit, because the frame format is not yet confirmed against the
-    board's own SDK. Sending a wrong servo command can drive the arm into its
-    end stops. Call `arm_live()` on the driver once verified.
+    Prefers the verified-envelope driver in drive.py. That driver gates its own
+    capabilities: the camera servos work by default because a mis-aimed camera
+    is bounded and reversible, while the treads stay inert until an operator
+    confirms the motor function with tools/verify_motion.py. The old yahboom.py
+    path is not used - its framing does not validate against this firmware.
     """
     try:
-        from .yahboom import YahboomRobot
+        from .drive import build as build_board
 
-        robot = YahboomRobot()
-        robot.open()
-        log.info("Yahboom driver active (dry-run; call arm_live() to transmit)")
-        return robot
-    except Exception as exc:  # noqa: BLE001 - any failure must not stop perception
-        log.warning("no Yahboom board usable (%s) - using NullRobot (no motion)", exc)
-        return NullRobot()
+        driver = build_board()
+        if driver is not None:
+            return driver
+    except Exception as exc:  # noqa: BLE001 - never let this stop perception
+        log.warning("board driver unavailable (%s)", exc)
+    log.info("no board driver - using NullRobot (logs intent, moves nothing)")
+    return NullRobot()

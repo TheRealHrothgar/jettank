@@ -140,6 +140,7 @@ class Loop:
         self._awake = False
         self._work: asyncio.Task | None = None
         self._killed = False
+        self._arm_requested = 0.0
 
         self.transcript: deque[dict] = deque(maxlen=32)
         self.observations: deque[str] = deque(maxlen=32)
@@ -348,6 +349,12 @@ class Loop:
                 if control == "stop":
                     self._interrupt("voice")
                     continue
+                if control == "disarm":
+                    self._set_motion(False, "voice")
+                    continue
+                if control == "arm":
+                    self._set_motion(True, "voice")
+                    continue
 
                 command = match_wake_word(text, wake)
                 if command is None:
@@ -434,6 +441,44 @@ class Loop:
             self.speaker.say("Shutting down. You will have to restart me from a terminal.")
         self._killed = True
         self.request_stop()
+
+    def _set_motion(self, enable: bool, source: str) -> None:
+        """Arm or disarm the motors. Arming reaches here only from a human.
+
+        The model can request arming (see the set_motion tool) but cannot
+        perform it: a request just makes Hank ask out loud, and the arming
+        itself happens when a person says the control phrase. Disarming has no
+        such restriction - anything may stop the robot.
+        """
+        if enable:
+            self.guard.clear_estop()
+            self.guard.enable(True)
+            self._arm_requested = 0.0
+            log.warning("[control] MOTION ARMED by %s", source)
+            if self.console:
+                self.console.event("err", f"motion ARMED ({source})")
+            self.say("Motion armed. Say Hank disarm to stop me moving.")
+        else:
+            self.guard.enable(False)
+            self.guard.stop()
+            log.info("[control] motion disarmed by %s", source)
+            if self.console:
+                self.console.event("agent", f"motion disarmed ({source})")
+            self.say("Motion disarmed.")
+
+    def request_arm(self, reason: str = "") -> dict:
+        """Called by the set_motion tool when Hank wants to move.
+
+        Does not arm anything. It asks, and records that an ask is outstanding
+        so the reply can say so honestly.
+        """
+        if self.guard.status().get("motion_enabled"):
+            return {"ok": True, "detail": "motion is already armed"}
+        self._arm_requested = time.monotonic()
+        return {"ok": False, "awaiting_human": True,
+                "detail": "I cannot arm my own motors. A person has to say "
+                          "'Hank arm motion' out loud. Tell them that, and why "
+                          "you want to move."}
 
     def _wake(self) -> None:
         self._awake = True

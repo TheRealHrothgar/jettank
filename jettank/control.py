@@ -53,6 +53,26 @@ KILL_PHRASES = _phrases(
     "hank override,override hank",
 )
 
+# Arming is a control word, not a tool, for the same reason halt and override
+# are: it is handled here, before any reasoning, so the decision to let the
+# robot move is always a human's and never a model's. Hank can ASK to be armed
+# (see the set_motion tool) but the arming itself happens only when a person
+# says one of these out loud.
+#
+# Disarming is not symmetric with arming and is not meant to be. Anything may
+# disarm - a tool call, the console, a control word - because stopping is
+# always the safe direction. Only starting needs a human.
+ARM_PHRASES = _phrases(
+    "JETTANK_ARM_WORDS",
+    "hank arm motion,hank enable motion,arm motion hank,enable motion hank,"
+    "hank you may move,hank permission to move,hank motion on",
+)
+DISARM_PHRASES = _phrases(
+    "JETTANK_DISARM_WORDS",
+    "hank disarm,hank disarm motion,hank disable motion,disarm hank,"
+    "hank motion off,hank do not move,hank dont move,hank stay still",
+)
+
 # Speech-to-text adds trailing punctuation and the occasional filler.
 _FILLER = re.compile(r"^(?:uh|um|er|ah|ok|okay|hey|please|now|just)\s+", re.I)
 _PUNCT = re.compile(r"[^\w\s]")
@@ -70,10 +90,12 @@ def normalise(text: str) -> str:
 
 
 def classify(text: str) -> str | None:
-    """Return 'stop', 'kill', or None.
+    """Return 'kill', 'stop', 'disarm', 'arm', or None.
 
-    Checked against the whole utterance only. KILL is tested first: if someone
-    manages to say both, the safer interpretation wins.
+    Checked against the whole utterance only. Order is by safety, not by
+    likelihood: kill, then stop, then disarm, then arm. If an utterance somehow
+    matches more than one, the more restrictive reading wins - the only
+    ambiguity that matters is one that could start the robot moving.
     """
     t = normalise(text)
     if not t:
@@ -82,4 +104,8 @@ def classify(text: str) -> str | None:
         return "kill"
     if t in STOP_PHRASES:
         return "stop"
+    if t in DISARM_PHRASES:
+        return "disarm"
+    if t in ARM_PHRASES:
+        return "arm"
     return None

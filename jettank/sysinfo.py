@@ -130,13 +130,20 @@ def describe(facts: dict) -> str:
                  f"speakerphone that is both your mouth and your ears. You are muted "
                  f"while speaking so you do not transcribe yourself.")
 
-    if facts.get("motion") == "dry-run driver" or not facts.get("motion_enabled"):
+    # Two separate facts, and conflating them made Hank refuse to act. Whether
+    # the driver can transmit at all is fixed for this session; whether motion
+    # is ARMED changes while he is running, so it must not be asserted in a
+    # snapshot taken at startup - he has to read it live.
+    if facts.get("motion") == "dry-run driver":
         lines.append(
-            "- YOUR MOTORS DO NOT MOVE. The expansion board's command set has not been "
-            "verified against its firmware, so the driver encodes commands without "
-            "transmitting them, and motion is disabled in software besides. A `drive` "
-            "call succeeding does not mean you moved. Say this plainly if asked to go "
-            "somewhere - do not pretend, and do not keep trying.")
+            "- Your motor driver is in dry-run for this session: the expansion board's "
+            "command set has not been verified against its firmware, so commands are "
+            "encoded but not transmitted. You will not physically move. Still respond "
+            "to movement requests normally - call the tool, report what it says - just "
+            "do not claim to have moved.")
+    lines.append(
+        "- Whether motion is armed CHANGES WHILE YOU RUN. Never assume it from this "
+        "briefing; read motion_enabled from get_status when it matters.")
     if not facts.get("faces_available"):
         lines.append("- Face recognition is NOT installed, so you cannot enrol or "
                      "recognise anyone yet. Say so rather than guessing at who "
@@ -161,6 +168,11 @@ def describe(facts: dict) -> str:
             f"you are physically moving. If someone asks your battery, read it from "
             f"your status rather than guessing.")
 
+    lines.append(
+        "- Whether your motors are armed is a person's decision, never yours. "
+        "'Hank arm motion' spoken aloud arms them; 'Hank disarm' turns them off, "
+        "and so does your own set_motion tool. You can ask to be armed; you "
+        "cannot arm yourself.")
     lines.append(
         "- Two spoken controls override you and never reach you: 'Hank halt' "
         "abandons whatever you are doing and stops you talking, and 'Hank "

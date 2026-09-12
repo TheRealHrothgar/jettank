@@ -553,6 +553,75 @@ check("the service honours the kill exit code",
       "RestartPreventExitStatus=42" in unit)
 check("the service would otherwise restart", "Restart=always" in unit)
 
+# ---------- arming is a human's decision ----------
+print("\nArming (human-only, asymmetric by design)")
+from jettank.control import ARM_PHRASES, DISARM_PHRASES  # noqa: E402
+
+check("arm phrases are recognised", classify("Hank arm motion") == "arm")
+check("enable motion is recognised", classify("hank enable motion") == "arm")
+check("disarm is recognised", classify("Hank, disarm.") == "disarm")
+check("motion off is recognised", classify("hank motion off") == "disarm")
+check("stay still disarms", classify("hank stay still") == "disarm")
+
+# Arming must never fire on speech that merely mentions it.
+check("talking about arming does not arm",
+      classify("can you arm the motion please") is None)
+check("past tense does not arm", classify("I armed the motion") is None)
+check("an ordinary question does not arm",
+      classify("hank what do you see") is None)
+
+# Every arm phrase requires his name, so none can fire on ambient speech.
+check("all arm phrases are name-prefixed or name-suffixed",
+      all("hank" in p for p in ARM_PHRASES), str(ARM_PHRASES))
+check("all disarm phrases mention him too",
+      all("hank" in p for p in DISARM_PHRASES), str(DISARM_PHRASES))
+check("arm and disarm never overlap",
+      not (set(ARM_PHRASES) & set(DISARM_PHRASES)))
+
+# The tool may disarm freely, but must not be able to arm.
+class ArmLoop:
+    def __init__(self, guard):
+        self.guard, self.said, self.console = guard, [], None
+        self._arm_requested = 0.0
+        self.cfg = type("C", (), {"cloud": type("D", (), {"autonomy_speaks": False})()})()
+
+    def say(self, t):
+        self.said.append(t)
+
+    _set_motion = Loop._set_motion
+    request_arm = Loop.request_arm
+
+
+rb5 = RecordingRobot()
+guard5 = MotionGuard(rb5, MotionLimits(timeout_s=99, max_run_s=99), enabled=False)
+al = ArmLoop(guard5)
+tb2 = ToolBox(al, guard5, FakeCam(), None, FakeSpeaker())
+
+res = tb2.dispatch("set_motion", {"enabled": True, "reason": "want to explore"})
+check("the tool cannot arm motion", res.get("ok") is False, str(res))
+check("it is still disarmed after the request",
+      guard5.status()["motion_enabled"] is False)
+check("the refusal explains who can arm",
+      "arm motion" in res.get("detail", "").lower(), str(res))
+check("the request is flagged as awaiting a human", res.get("awaiting_human") is True)
+
+# A human saying the words does arm it.
+al._set_motion(True, "voice")
+check("a spoken control word arms it", guard5.status()["motion_enabled"] is True)
+check("arming is announced aloud", any("armed" in s.lower() for s in al.said))
+check("an armed guard accepts drive", guard5.drive(0.1, 0.0)[0] is True)
+
+# Disarming is unconditional and available to the tool.
+res = tb2.dispatch("set_motion", {"enabled": False})
+check("the tool may always disarm", res.get("ok") is True, str(res))
+check("it is disarmed afterwards", guard5.status()["motion_enabled"] is False)
+check("a disarmed guard refuses drive", guard5.drive(0.1, 0.0)[0] is False)
+
+# There is still no tool that clears an E-STOP.
+check("no tool clears an estop",
+      not ({"clear_estop", "reset_estop"} & {t["name"] for t in TOOL_SCHEMAS}))
+guard5.close()
+
 # ---------- conversation: wake, continue, rest ----------
 print("\nConversation (wake, continue, rest)")
 

@@ -392,6 +392,25 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "set_motion",
+        "description": (
+            "Turn your own motors OFF, or ASK to have them turned on. "
+            "enabled=false disarms immediately and always works - stopping is always "
+            "allowed. enabled=true does NOT arm you: you cannot arm your own motors. "
+            "It records that you want to move, and you must then tell the person out "
+            "loud that they need to say 'Hank arm motion', and why you want to move. "
+            "Do not pretend you have been armed, and do not ask repeatedly."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "reason": {"type": "string", "description": "why you want to move"},
+            },
+            "required": ["enabled"],
+        },
+    },
+    {
         "name": "write_behavior",
         "description": (
             "Write NEW PYTHON CODE for yourself, to do something your existing tools cannot "
@@ -541,6 +560,13 @@ class ToolBox:
     def _t_drive(self, linear: float, angular: float, reason: str = "") -> dict:
         accepted, note = self._guard.drive(float(linear), float(angular), reason)
         return {"ok": accepted, "detail": note}
+
+    def _t_set_motion(self, enabled: bool, reason: str = "") -> dict:
+        # Disabling is unconditional; enabling is a request a human must grant.
+        if not enabled:
+            self._loop._set_motion(False, "hank")
+            return {"ok": True, "motion_enabled": False, "detail": "motors disarmed"}
+        return self._loop.request_arm(reason)
 
     def _t_stop(self) -> dict:
         self._guard.stop()

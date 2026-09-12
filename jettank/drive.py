@@ -58,6 +58,17 @@ FUNC_MOTION = 0x12
 # limits, because this one survives even if the guard is misconfigured.
 MAX_MOTOR = int(os.environ.get("JETTANK_MAX_MOTOR", "30"))      # of 100
 
+# The camera head is a different risk class from the treads and is gated
+# separately. Pan/tilt cannot drive the robot anywhere: worst case it points
+# the camera somewhere useless, which is visible and instantly reversible.
+# Treads can leave the table. So servos default to on and motors do not.
+SERVOS_DEFAULT_ON = os.environ.get("JETTANK_SERVOS", "1") not in ("0", "false", "no")
+
+# Angle limits, applied here as well as upstream. The gimbal has end stops and
+# driving a servo into one stalls it, which draws current and cooks it.
+PAN_LIMIT = int(os.environ.get("JETTANK_PAN_LIMIT", "80"))
+TILT_LIMIT = int(os.environ.get("JETTANK_TILT_LIMIT", "40"))
+
 
 def encode(func: int, payload: bytes) -> bytes:
     """Frame a command using the verified envelope."""
@@ -147,8 +158,14 @@ class RosmasterDriver:
         self._invert_left = bool(self._v.get("invert_left", False))
         self._invert_right = bool(self._v.get("invert_right", False))
         self._last_cmd = 0.0
+        self.pan = 0.0
+        self.tilt = 0.0
 
     def confirmed(self, name: str) -> bool:
+        # Servos are allowed without a recorded confirmation because the
+        # consequence of being wrong is bounded - see SERVOS_DEFAULT_ON.
+        if name == "servo" and SERVOS_DEFAULT_ON and "servo" not in self._v:
+            return True
         return bool(self._v.get(name))
 
     # ---- motion ----
@@ -180,13 +197,18 @@ class RosmasterDriver:
 
     # ---- camera head ----
     def look(self, pan: float, tilt: float) -> None:
+        """Aim the camera head. Angles are degrees from centre."""
         if not self.confirmed("servo"):
-            log.warning("[look] servo function unconfirmed - not transmitting")
+            log.warning("[look] servos disabled - not transmitting")
             return
         pan_id = int(self._v.get("pan_servo", 1))
         tilt_id = int(self._v.get("tilt_servo", 2))
-        self._link.send(servo_frame(pan_id, 90 + max(-90, min(90, pan))))
-        self._link.send(servo_frame(tilt_id, 90 + max(-45, min(45, tilt))))
+        p = max(-PAN_LIMIT, min(PAN_LIMIT, float(pan)))
+        t = max(-TILT_LIMIT, min(TILT_LIMIT, float(tilt)))
+        self._link.send(servo_frame(pan_id, int(90 + p)))
+        time.sleep(0.02)                     # the board drops back-to-back frames
+        self._link.send(servo_frame(tilt_id, int(90 - t)))
+        self.pan, self.tilt = p, t
 
     def arm(self, joint: str, angle: float) -> None:
         log.warning("[arm] the arm's protocol is not verified - not transmitting")
@@ -212,8 +234,8 @@ def build(port: str = "/dev/ttyTHS1"):
     to work.
     """
     v = load_verification()
-    if not v.get("motor"):
-        log.info("motion not verified on this board - see tools/verify_motion.py")
+    if not v.get("motor") and not SERVOS_DEFAULT_ON:
+        log.info("nothing verified to drive - see tools/verify_motion.py")
         return None
     link = BoardLink(port)
     try:
@@ -223,4 +245,7 @@ def build(port: str = "/dev/ttyTHS1"):
         return None
     driver = RosmasterDriver(link, v)
     driver.stop()                     # known state before anything else happens
+    log.info("board driver active: servos=%s motors=%s",
+             driver.confirmed("servo"),
+             "verified" if v.get("motor") else "NOT verified (dry)")
     return driver
