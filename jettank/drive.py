@@ -72,6 +72,10 @@ FUNC_VERSION = 0x51
 # Hard ceiling in the driver, below whatever MotionGuard allows. Two independent
 # limits, because this one survives even if the guard is misconfigured.
 MAX_MOTOR = int(os.environ.get("JETTANK_MAX_MOTOR", "30"))      # of 100
+# Transbot's own ceilings are 0.45 m/s and 2 rad/s. Ours are deliberately well
+# under them - this is an indoor robot on a wooden floor with a dog nearby.
+MAX_SPEED_MS = float(os.environ.get("JETTANK_MAX_SPEED", "0.18"))
+MAX_TURN_RADS = float(os.environ.get("JETTANK_MAX_TURN", "0.9"))
 
 # The camera head is a different risk class from the treads and is gated
 # separately. Pan/tilt cannot drive the robot anywhere: worst case it points
@@ -96,9 +100,28 @@ def motor_frame(index: int, speed: int) -> bytes:
                   + struct.pack("<h", spd))
 
 
+def motion_frame(velocity: float, angular: float) -> bytes:
+    """Differential drive in one frame - the board mixes the tracks itself.
+
+    This is how Transbot_Lib actually drives: velocity in m/s and angular in
+    rad/s, not per-track speeds. Sending two separate motor frames instead
+    meant the tracks were commanded a hundredth of a second apart and, in
+    practice, only the second one took effect.
+
+    Note the asymmetric packing, which is Yahboom's: velocity is sent as a
+    SINGLE byte (the low byte of velocity*100, so -45..45 fits), while angular
+    is a full little-endian int16.
+    """
+    v = max(-MAX_SPEED_MS, min(MAX_SPEED_MS, float(velocity)))
+    a = max(-MAX_TURN_RADS, min(MAX_TURN_RADS, float(angular)))
+    vb = struct.pack("<h", int(v * 100))[0:1]
+    ab = struct.pack("<h", int(a * 100))
+    return encode(FUNC_MOTION, vb + ab)
+
+
 def stop_frames() -> list[bytes]:
-    """Both treads to zero. A list because each motor is addressed separately."""
-    return [motor_frame(1, 0), motor_frame(2, 0)]
+    """Everything to zero, by every route we know. Stopping is worth redundancy."""
+    return [motion_frame(0.0, 0.0), motor_frame(1, 0), motor_frame(2, 0)]
 
 
 def beep_frame(ms: int) -> bytes:
@@ -190,18 +213,22 @@ class RosmasterDriver:
         return bool(self._v.get(name))
 
     # ---- motion ----
-    def drive(self, left: float, right: float) -> None:
-        """left/right in -1..1. Scaled to the driver's own ceiling."""
+    def drive(self, linear: float, angular: float) -> None:
+        """linear and angular, each -1..1, scaled to this driver's ceilings.
+
+        These are the same units MotionGuard works in. They used to be read as
+        per-track speeds, so a request to go straight forward drove one track
+        and the robot turned instead.
+        """
         if not self.confirmed("motor"):
             log.warning("[drive] motor function unconfirmed - not transmitting "
                         "(run tools/verify_motion.py)")
             return
-        l = int(max(-1.0, min(1.0, left)) * MAX_MOTOR) * (-1 if self._invert_left else 1)
-        r = int(max(-1.0, min(1.0, right)) * MAX_MOTOR) * (-1 if self._invert_right else 1)
-        # This board addresses two treads directly, one frame each.
-        self._link.send(motor_frame(self.left_index, l))
-        time.sleep(0.01)
-        self._link.send(motor_frame(self.right_index, r))
+        v = max(-1.0, min(1.0, float(linear))) * MAX_SPEED_MS
+        a = max(-1.0, min(1.0, float(angular))) * MAX_TURN_RADS
+        if self._invert_left or self._invert_right:
+            v = -v
+        self._link.send(motion_frame(v, a))
         self._last_cmd = time.monotonic()
 
     def stop(self) -> None:

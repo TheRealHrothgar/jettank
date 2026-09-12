@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 
 
 class RobotDriver(Protocol):
-    def drive(self, left: float, right: float) -> None: ...
+    def drive(self, linear: float, angular: float) -> None: ...
     def stop(self) -> None: ...
     def arm(self, joint: str, angle: float) -> None: ...
     def gripper(self, closed: bool) -> None: ...
@@ -25,8 +25,8 @@ class RobotDriver(Protocol):
 class NullRobot:
     """Logs intent without moving anything. Used until the real SDK is wired up."""
 
-    def drive(self, left: float, right: float) -> None:
-        log.info("[robot] drive l=%.2f r=%.2f", left, right)
+    def drive(self, linear: float, angular: float) -> None:
+        log.info("[robot] drive linear=%.2f angular=%.2f", linear, angular)
 
     def stop(self) -> None:
         log.info("[robot] stop")
@@ -50,8 +50,13 @@ def build() -> RobotDriver:
     Prefers the verified-envelope driver in drive.py. That driver gates its own
     capabilities: the camera servos work by default because a mis-aimed camera
     is bounded and reversible, while the treads stay inert until an operator
-    confirms the motor function with tools/verify_motion.py. The old yahboom.py
-    path is not used - its framing does not validate against this firmware.
+    confirms the motor function with tools/verify_motion.py.
+
+    The old yahboom.py is deleted rather than left in place. It implemented the
+    Rosmaster protocol, which is a DIFFERENT PRODUCT's library - wrong device
+    id, wrong checksum, and a function map where 0x02 means BEEP instead of
+    MOTION. Keeping it around as a fallback would only invite someone to
+    resurrect the exact bug that made the treads run away.
     """
     try:
         from .drive import build as build_board
