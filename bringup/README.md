@@ -256,7 +256,41 @@ in-process, warmed on a background thread at startup, and audio is streamed to
 python3 -m jettank.loop --voice
 ```
 
-#### Audio traps on this board, all of which cost us a round
+#### The one that mattered most: the speakerphone runs at exactly one rate
+
+```
+$ cat /proc/asound/card0/stream0
+Playback: ... Rates: 48000
+Capture:  ... Rates: 48000
+```
+
+**48000 Hz, both directions, and nothing else.** Ask for any other rate and
+ALSA's `plug` layer resamples in realtime. Capture at 16 kHz (what whisper
+wants) and play at 22.05 kHz (what Piper emits) and it is doing **two live
+conversions at once**, on a *full speed* USB device, while the GPU runs a VLM
+and the CPU runs whisper.
+
+That is what produced, in order: garbled long utterances, a clipped first
+syllable, and audible skipping. It cost several rounds of chasing the wrong
+layer — the text, the pacing, aplay's buffer sizes, streaming versus WAV —
+because **every one of those reproduces clean in isolation**. Only one stream
+is ever active on a test bench.
+
+The fix is to do both conversions ourselves, offline, and hand the device its
+own rate:
+
+* capture with `arecord -r 48000`, then `audioop.ratecv` down to 16 kHz for
+  whisper;
+* synthesise at Piper's 22.05 kHz, `ratecv` up to 48 kHz, then play.
+
+ALSA is then left with nothing to resample. `JETTANK_AUDIO_RATE` overrides it
+for different hardware.
+
+**Check `/proc/asound/card*/stream0` before assuming a USB audio device will
+accept your preferred rate.** It is one command and it would have saved all of
+this.
+
+#### Other audio traps on this board, all of which cost us a round
 
 * **Never use ALSA `default` for capture.** On JetPack it resolves to a Tegra
   APE virtual card that opens happily and returns **digital silence forever** —

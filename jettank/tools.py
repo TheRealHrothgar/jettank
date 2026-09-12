@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import wave
@@ -745,6 +746,20 @@ class Speaker:
         return self.LEAD_IN_WARM_MS if warm else self.LEAD_IN_MS
 
     @staticmethod
+    def resample(pcm: bytes, src_rate: int, dst_rate: int, channels: int = 1) -> bytes:
+        """Convert sample rate offline, so ALSA never has to do it live."""
+        if src_rate == dst_rate or not pcm:
+            return pcm
+        try:
+            import audioop
+
+            converted, _ = audioop.ratecv(pcm, 2, channels, src_rate, dst_rate, None)
+            return converted
+        except Exception as exc:  # noqa: BLE001 - fall back to letting ALSA cope
+            log.debug("offline resample unavailable (%s)", exc)
+            return pcm
+
+    @staticmethod
     def _silence(rate: int, ms: int) -> bytes:
         return b"\x00" * (2 * int(rate * ms / 1000))
 
@@ -788,6 +803,15 @@ class Speaker:
     # back-and-forth conversation the amplifier is still up from the previous
     # reply, and paying half a second before every turn would make Hank feel
     # sluggish for no benefit.
+    # The speakerphone supports exactly one rate - 48000 Hz, both directions
+    # (see /proc/asound/card0/stream0). Anything else makes ALSA's plug layer
+    # resample in realtime, and with the mic also open it is doing two
+    # conversions at once on a full-speed USB device. That is what the skipping
+    # and the garbled long utterances were: not the text, not the buffering,
+    # and not aplay - two realtime resamplers fighting over one clock.
+    #
+    # So we resample once, offline, and hand the device its native rate.
+    DEVICE_RATE = int(os.environ.get("JETTANK_AUDIO_RATE", "48000"))
     LEAD_IN_MS = int(os.environ.get("JETTANK_TTS_LEAD_IN_MS", "600"))
     LEAD_IN_WARM_MS = int(os.environ.get("JETTANK_TTS_LEAD_IN_WARM_MS", "120"))
     WARM_WINDOW_S = float(os.environ.get("JETTANK_TTS_WARM_WINDOW", "8.0"))
@@ -818,105 +842,85 @@ class Speaker:
             log.debug("speech dump failed: %s", exc)
 
     def _speak_piper(self, text: str) -> dict:
-        """Stream to aplay, prebuffered so it never starves.
+        """Synthesise to a temp file, then hand the file to aplay.
 
-        Latency is one prebuffer (~400ms) rather than the whole utterance, and
-        nothing larger than that is ever held in memory.
+        Streaming raw PCM into aplay was rewritten three times and kept
+        failing on the robot in ways that never reproduced on the bench:
+        garbled long utterances, then skipping. The reason is that streaming
+        makes playback depend on *our* process being scheduled promptly for
+        the entire duration of the audio - and on this board, speech competes
+        with VLM inference on the GPU, whisper on the CPU, and the perception
+        loop. Miss a deadline and the sound card runs dry.
+
+        Handing aplay a file removes that dependency entirely: it reads from
+        disk at its own pace and cannot be starved by anything we do. Every
+        listening test of file playback has been clean, including under load
+        and with the mic held open, which is the evidence this is built on.
+
+        The cost is synthesis latency before the first sound - roughly 0.15x
+        the audio length, so about 0.7s for a five-second reply. That is a
+        real cost and it buys reliability, which for speech is worth more.
         """
         voice = self._load_piper()
         syn = self._syn_config()
-        proc = None
-        pending = bytearray()
-        rate = 22050
-        channels = 1
-        written = 0
-        first = True
-        dumped = bytearray() if self.DUMP_DIR else None
-
-        def start(rate: int, channels: int):
-            return subprocess.Popen(
-                ["aplay", "-q", "-D", self._device, "-t", "raw",
-                 "-f", "S16_LE", "-r", str(rate), "-c", str(channels),
-                 "--buffer-time", str(self.ALSA_BUFFER_US),
-                 "--period-time", str(self.ALSA_PERIOD_US)],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-
-        def flush(proc, buf: bytearray, block: int) -> int:
-            """Write whole blocks; leave any remainder in buf."""
-            n = 0
-            while len(buf) >= block:
-                chunk = bytes(buf[:block])
-                proc.stdin.write(chunk)
-                if dumped is not None:
-                    dumped += chunk
-                del buf[:block]
-                n += block
-            return n
-
-        try:
-            for chunk in (voice.synthesize(text, syn) if syn
-                          else voice.synthesize(text)):
-                if self._abort.is_set():
-                    return {"ok": False, "spoken_text": text, "aborted": True,
-                            "error": "speech interrupted"}
-                if first:
-                    rate = getattr(chunk, "sample_rate", 22050)
-                    channels = getattr(chunk, "sample_channels", 1)
-                    first = False
-                elif self.SENTENCE_GAP_MS > 0:
-                    pending += self._silence(rate, self.SENTENCE_GAP_MS)
-                pending += self._pcm_of(chunk)
-
-                prebuffer = 2 * channels * int(rate * self.PREBUFFER_MS / 1000)
-                if proc is None:
-                    if len(pending) < prebuffer:
-                        continue            # keep filling; do not start starved
-                    proc = start(rate, channels)
-                    lead = self._lead_in_ms()
-                    if lead > 0:
-                        proc.stdin.write(self._silence(rate, lead))
-                self._playing = proc
-                written += flush(proc, pending, 2 * channels *
-                                 int(rate * self.WRITE_BLOCK_MS / 1000))
-
-            if proc is None:                # utterance shorter than the prebuffer
-                if not pending:
-                    return {"ok": False, "error": "TTS produced no audio",
-                            "spoken_text": text}
-                proc = start(rate, channels)
-                lead = self._lead_in_ms()
-                if lead > 0:
-                    proc.stdin.write(self._silence(rate, lead))
-            if pending:
-                proc.stdin.write(bytes(pending))
-                if dumped is not None:
-                    dumped += bytes(pending)
-                written += len(pending)
-        except BrokenPipeError:
-            return {"ok": False, "spoken_text": text,
-                    "error": f"audio device {self._device} unavailable "
-                             f"(is something else using it?)"}
-        finally:
-            if proc is not None:
-                with contextlib.suppress(BrokenPipeError, OSError):
-                    proc.stdin.close()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=max(30.0, written / 2 / max(rate, 1) + 15))
-            self._playing = None
-
+        chunks = list(voice.synthesize(text, syn) if syn else voice.synthesize(text))
+        if not chunks:
+            return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
         if self._abort.is_set():
             return {"ok": False, "spoken_text": text, "aborted": True,
                     "error": "speech interrupted"}
 
-        if dumped is not None:
-            self._dump(bytes(dumped), rate, channels, text)
-        if not written:
-            return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
+        rate = getattr(chunks[0], "sample_rate", 22050)
+        channels = getattr(chunks[0], "sample_channels", 1)
+        gap = (self._silence(rate, self.SENTENCE_GAP_MS)
+               if self.SENTENCE_GAP_MS > 0 else b"")
+        # Lead-in silence still matters: the speakerphone's amplifier sleeps
+        # and clips the opening syllable without it.
+        pcm = gap.join(self._pcm_of(c) for c in chunks)
+        # Resample to the device's native rate before adding the lead-in, so
+        # the silence is generated at the final rate and stays exact.
+        if self.DEVICE_RATE and self.DEVICE_RATE != rate:
+            pcm = self.resample(pcm, rate, self.DEVICE_RATE, channels)
+            rate = self.DEVICE_RATE
+        pcm = self._silence(rate, self._lead_in_ms()) + pcm
+
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False,
+                                             prefix="hank-say-") as fh:
+                path = fh.name
+            with wave.open(path, "wb") as w:
+                w.setnchannels(channels)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(pcm)
+            self._dump(pcm, rate, channels, text)
+
+            proc = subprocess.Popen(["aplay", "-q", "-D", self._device, path],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE)
+            self._playing = proc
+            duration = len(pcm) / 2 / channels / rate
+            try:
+                proc.wait(timeout=duration + 20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                return {"ok": False, "error": "playback timed out",
+                        "spoken_text": text}
+        except FileNotFoundError:
+            return {"ok": False, "error": "aplay not installed", "spoken_text": text}
+        finally:
+            self._playing = None
+            if path:
+                with contextlib.suppress(OSError):
+                    Path(path).unlink()
+
+        if self._abort.is_set():
+            return {"ok": False, "spoken_text": text, "aborted": True,
+                    "error": "speech interrupted"}
         self._last_spoke = time.monotonic()
         return {"ok": True, "spoken_text": text,
-                "duration_s": round(written / 2 / channels / rate, 2)}
+                "duration_s": round(len(pcm) / 2 / channels / rate, 2)}
 
     @staticmethod
     def _pcm_of(chunk) -> bytes:

@@ -30,11 +30,33 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 RATE = 16000          # what every whisper build expects
+# The speakerphone runs at exactly one rate, 48000 Hz, in both directions. Ask
+# arecord for 16000 and ALSA's plug layer resamples in realtime - and with
+# playback also running it does that alongside a second live conversion, on a
+# full-speed USB device. Capture at the device's own rate and convert offline;
+# whisper still gets its 16 kHz, ALSA is left with nothing to do.
+DEVICE_RATE = int(os.environ.get("JETTANK_AUDIO_RATE", "48000"))
 CHANNELS = 1
 SAMPLE_BYTES = 2      # s16le
 CHUNK_MS = 30
 CHUNK_FRAMES = RATE * CHUNK_MS // 1000
 CHUNK_BYTES = CHUNK_FRAMES * CHANNELS * SAMPLE_BYTES
+# What we actually pull off the device per chunk, before converting to 16 kHz.
+DEVICE_CHUNK_BYTES = DEVICE_RATE * CHUNK_MS // 1000 * CHANNELS * SAMPLE_BYTES
+
+
+def downsample(pcm: bytes, src_rate: int = DEVICE_RATE, dst_rate: int = RATE) -> bytes:
+    """Device rate -> whisper's rate, done here rather than by ALSA."""
+    if src_rate == dst_rate or not pcm:
+        return pcm
+    try:
+        import audioop
+
+        out, _ = audioop.ratecv(pcm, SAMPLE_BYTES, CHANNELS, src_rate, dst_rate, None)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log.debug("offline downsample unavailable (%s)", exc)
+        return pcm
 WARMUP_MS = 1200      # arecord + AGC settling; the levels here are garbage
 
 
@@ -257,7 +279,7 @@ class VoiceListener:
         if self._proc is not None:
             return
         self._proc = subprocess.Popen(
-            ["arecord", "-D", self.device, "-f", "S16_LE", "-r", str(RATE),
+            ["arecord", "-D", self.device, "-f", "S16_LE", "-r", str(DEVICE_RATE),
              "-c", str(CHANNELS), "-t", "raw", "-q"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
@@ -266,11 +288,20 @@ class VoiceListener:
         self._discard(WARMUP_MS)
         log.info("listening on %s (backend %s)", self.device, self.stt.backend)
 
+    def _read_chunk(self) -> bytes | None:
+        """One chunk at the device rate, returned at whisper's rate."""
+        if self._proc is None or self._proc.stdout is None:
+            return None
+        raw = self._proc.stdout.read(DEVICE_CHUNK_BYTES)
+        if not raw or len(raw) < DEVICE_CHUNK_BYTES:
+            return None
+        return downsample(raw)
+
     def _discard(self, ms: int) -> None:
         if self._proc is None or self._proc.stdout is None:
             return
         for _ in range(max(0, ms // CHUNK_MS)):
-            if not self._proc.stdout.read(CHUNK_BYTES):
+            if self._read_chunk() is None:
                 return
 
     def stop(self) -> None:
@@ -296,8 +327,8 @@ class VoiceListener:
             return self.threshold
         peak = 0.0
         for _ in range(max(1, int(seconds * 1000) // CHUNK_MS)):
-            chunk = self._proc.stdout.read(CHUNK_BYTES)
-            if not chunk or len(chunk) < CHUNK_BYTES:
+            chunk = self._read_chunk()
+            if chunk is None:
                 break
             peak = max(peak, _rms(chunk))
         # 3x an already-high floor puts the gate above conversational speech.
@@ -328,8 +359,8 @@ class VoiceListener:
         """Accumulate audio and cut when Silero says the speaker has finished."""
         buf = bytearray()
         while True:
-            chunk = self._proc.stdout.read(CHUNK_BYTES)
-            if not chunk or len(chunk) < CHUNK_BYTES:
+            chunk = self._read_chunk()
+            if chunk is None:
                 return ""
             if self._muted:
                 buf.clear()
@@ -362,8 +393,8 @@ class VoiceListener:
         speech: list[bytes] = []
         quiet = 0
         while True:
-            chunk = self._proc.stdout.read(CHUNK_BYTES)
-            if not chunk or len(chunk) < CHUNK_BYTES:
+            chunk = self._read_chunk()
+            if chunk is None:
                 return ""  # mic went away; caller decides whether to restart
             if self._muted:
                 speech.clear()

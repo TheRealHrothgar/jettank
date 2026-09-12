@@ -398,15 +398,21 @@ check("empty buffer is safe", _rms(b"") == 0.0)
 print("\nPre-roll (wake word must survive the gate)")
 import io  # noqa: E402
 import re  # noqa: E402
-from jettank.audio import CHUNK_BYTES, VoiceListener  # noqa: E402
+from jettank.audio import (CHUNK_BYTES, DEVICE_CHUNK_BYTES,  # noqa: E402
+                           VoiceListener)
 
 
 class FakeMic:
-    """Feeds a scripted PCM stream through the same read() the real mic uses."""
+    """Feeds a scripted PCM stream through the same read() the real mic uses.
+
+    Chunks are device-rate sized: the reader pulls at the speakerphone's native
+    48 kHz and downsamples to whisper's 16 kHz itself, so ALSA is never asked
+    to resample live.
+    """
 
     def __init__(self, pattern):
-        loud = (b"\x00\x40" * (CHUNK_BYTES // 2))
-        quiet = b"\x00\x00" * (CHUNK_BYTES // 2)
+        loud = (b"\x00\x40" * (DEVICE_CHUNK_BYTES // 2))
+        quiet = b"\x00\x00" * (DEVICE_CHUNK_BYTES // 2)
         self.stdout = io.BytesIO(b"".join(loud if c == "L" else quiet for c in pattern))
 
 
