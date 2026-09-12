@@ -53,6 +53,13 @@ class VLMConfig:
     model: str = field(default_factory=lambda: _env("JETTANK_VLM_MODEL", "qwen2.5vl:3b"))
     # How often we ask the local model to describe the scene.
     interval_s: float = field(default_factory=lambda: _env_f("JETTANK_VLM_INTERVAL", 1.5))
+    # And how often when nobody is talking to him. The vision model pins the
+    # GPU at 99% for several seconds per frame; running it continuously to
+    # describe an empty room is most of the idle power draw, which matters
+    # enormously on battery. He still looks, just far less often, and drops
+    # straight back to the fast rate the moment he is woken.
+    idle_interval_s: float = field(
+        default_factory=lambda: _env_f("JETTANK_VLM_IDLE_INTERVAL", 20.0))
     timeout_s: float = field(default_factory=lambda: _env_f("JETTANK_VLM_TIMEOUT", 20.0))
     max_tokens: int = 128
     # A small text-only model that turns structured findings and machine text

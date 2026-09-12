@@ -133,6 +133,16 @@ def servo_frame(servo_id: int, angle: int) -> bytes:
                   bytes((max(1, min(int(servo_id), 4)), max(0, min(int(angle), 180)))))
 
 
+def headlight_frame(brightness: int) -> bytes:
+    """The two white floodlights on the camera head. 0-100.
+
+    Worth more than it looks: the detector reads 3/255 average brightness in an
+    unlit room, which no model can work with. His own headlights are the
+    difference between seeing people and not.
+    """
+    return encode(FUNC_BIG_LED, bytes((max(0, min(int(brightness), 100)),)))
+
+
 def rgb_frame(index: int, r: int, g: int, b: int) -> bytes:
     return encode(FUNC_RGB, bytes((index & 0xFF, r & 0xFF, g & 0xFF, b & 0xFF)))
 
@@ -202,6 +212,7 @@ class RosmasterDriver:
         self._last_cmd = 0.0
         self.pan = 0.0
         self.tilt = 0.0
+        self.light = 0
         self._pan_sign = 1 if self._v.get("pan_sign", 1) >= 0 else -1
         self._tilt_sign = 1 if self._v.get("tilt_sign", 1) >= 0 else -1
 
@@ -267,6 +278,11 @@ class RosmasterDriver:
 
     def gripper(self, closed: bool) -> None:
         log.warning("[gripper] not verified - not transmitting")
+
+    def headlights(self, brightness: int) -> None:
+        """0 off, 100 full. Safe regardless of motor verification."""
+        self._link.send(headlight_frame(brightness))
+        self.light = max(0, min(int(brightness), 100))
 
     def beep(self, ms: int = 100) -> None:
         if not self.confirmed("beep"):

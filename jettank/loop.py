@@ -109,6 +109,7 @@ class Loop:
         # Config objects are frozen - they record how we booted. Settings the
         # agent may retune at runtime live here instead.
         self.vlm_interval = cfg.vlm.interval_s
+        self.vlm_idle_interval = cfg.vlm.idle_interval_s
         self.cloud_min_interval = cfg.cloud.min_interval_s
         self.cam_width = cfg.camera.width
         self.cam_height = cfg.camera.height
@@ -163,7 +164,10 @@ class Loop:
 
     async def perceive_forever(self) -> None:
         while not self._stop.is_set():
-            interval = self.vlm_interval
+            # Awake means someone is engaged and wants quick answers; resting
+            # means the room is empty and every inference is battery burned to
+            # describe nothing.
+            interval = self.vlm_interval if self._awake else self.vlm_idle_interval
             started = time.monotonic()
             if self.static_image_b64:
                 seq, img = self.frames_seen + 1, self.static_image_b64
