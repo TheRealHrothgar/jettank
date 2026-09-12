@@ -18,6 +18,7 @@ class RobotDriver(Protocol):
     def stop(self) -> None: ...
     def arm(self, joint: str, angle: float) -> None: ...
     def gripper(self, closed: bool) -> None: ...
+    def look(self, pan: float, tilt: float) -> None: ...
     def say(self, text: str) -> None: ...
 
 
@@ -35,6 +36,9 @@ class NullRobot:
 
     def gripper(self, closed: bool) -> None:
         log.info("[robot] gripper %s", "close" if closed else "open")
+
+    def look(self, pan: float, tilt: float) -> None:
+        log.info("[robot] look pan=%.1f tilt=%.1f", pan, tilt)
 
     def say(self, text: str) -> None:
         log.info("[robot] say %r", text)

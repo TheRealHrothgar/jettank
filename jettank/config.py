@@ -84,10 +84,40 @@ class CloudConfig:
 
 
 @dataclass(frozen=True)
+class VoiceConfig:
+    """Spoken command and control. Audio is transcribed on-device; only the
+    resulting text reaches the cloud agent."""
+
+    enabled: bool = field(default_factory=lambda: _env_b("JETTANK_VOICE", False))
+    mic: str = field(default_factory=lambda: _env("JETTANK_MIC", "default"))
+    stt_backend: str = field(default_factory=lambda: _env("JETTANK_STT_BACKEND", "auto"))
+    stt_model: str = field(default_factory=lambda: _env("JETTANK_STT_MODEL", "base.en"))
+    # Empty means always-on: every utterance becomes a command. A wake word is
+    # strongly preferred on a robot that is also listening to a room.
+    wake_word: str = field(default_factory=lambda: _env("JETTANK_WAKE_WORD", "hey tank"))
+    # Energy gate, 0..1. Raise it if the robot's own fans keep triggering it.
+    threshold: float = field(default_factory=lambda: _env_f("JETTANK_MIC_THRESHOLD", 0.02))
+    silence_ms: int = field(default_factory=lambda: _env_i("JETTANK_MIC_SILENCE_MS", 700))
+
+
+@dataclass(frozen=True)
+class ConsoleConfig:
+    """Browser console: live camera view plus a command box."""
+
+    enabled: bool = field(default_factory=lambda: _env_b("JETTANK_CONSOLE", False))
+    # Binds to all interfaces by default because the point is to reach it from
+    # a laptop on the same LAN. There is no auth - keep it off untrusted nets.
+    host: str = field(default_factory=lambda: _env("JETTANK_CONSOLE_HOST", "0.0.0.0"))
+    port: int = field(default_factory=lambda: _env_i("JETTANK_CONSOLE_PORT", 8080))
+
+
+@dataclass(frozen=True)
 class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     vlm: VLMConfig = field(default_factory=VLMConfig)
     cloud: CloudConfig = field(default_factory=CloudConfig)
+    voice: VoiceConfig = field(default_factory=VoiceConfig)
+    console: ConsoleConfig = field(default_factory=ConsoleConfig)
     # Safety: the local loop must keep running even if everything else stalls.
     watchdog_s: float = field(default_factory=lambda: _env_f("JETTANK_WATCHDOG", 5.0))
 

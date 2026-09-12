@@ -19,9 +19,14 @@ import time
 from collections import deque
 
 from . import config as cfg_mod
+from .audio import Transcriber, VoiceListener, match_wake_word
 from .camera import build_camera
-from .cloud import CloudAgent
+from .console import Console
+from .cloud import AgentSession, CloudAgent, register_tools
+from .faces import FaceEngine
 from .robot import build as build_robot
+from .safety import MotionGuard
+from .tools import TOOL_SCHEMAS, Speaker, ToolBox
 from .vlm import LocalVLM
 
 log = logging.getLogger("jettank")
@@ -38,6 +43,38 @@ class Loop:
             cfg.cloud.api_key, cfg.cloud.timeout_s, cfg.cloud.max_tokens,
         )
         self.robot = build_robot()
+
+        # Everything the cloud agent is allowed to touch goes through here.
+        # Motion starts disabled: MotionGuard.enable() is a local-operator
+        # action and is deliberately not reachable as a tool.
+        self.guard = MotionGuard(self.robot, enabled=False)
+        self.faces = FaceEngine()
+        self.speaker = Speaker()
+        self.toolbox = ToolBox(self, self.guard, self.camera, self.faces, self.speaker)
+        register_tools(TOOL_SCHEMAS)
+        self.agent = AgentSession(self.cloud, self.toolbox)
+
+        # Config objects are frozen - they record how we booted. Settings the
+        # agent may retune at runtime live here instead.
+        self.vlm_interval = cfg.vlm.interval_s
+        self.cloud_min_interval = cfg.cloud.min_interval_s
+        self.cam_width = cfg.camera.width
+        self.cam_height = cfg.camera.height
+
+        self.voice: VoiceListener | None = None
+        if cfg.voice.enabled:
+            self.voice = VoiceListener(
+                device=cfg.voice.mic,
+                transcriber=Transcriber(cfg.voice.stt_backend, cfg.voice.stt_model),
+                threshold=cfg.voice.threshold,
+                silence_ms=cfg.voice.silence_ms,
+            )
+
+        self.console: Console | None = None
+        if cfg.console.enabled:
+            self.console = Console(self, cfg.console.host, cfg.console.port)
+
+        self.transcript: deque[dict] = deque(maxlen=32)
         self.observations: deque[str] = deque(maxlen=32)
         self.last_image_b64: str | None = None
         self.plan: dict | None = None
@@ -51,8 +88,8 @@ class Loop:
     # ---------------- fast loop ----------------
 
     async def perceive_forever(self) -> None:
-        interval = self.cfg.vlm.interval_s
         while not self._stop.is_set():
+            interval = self.vlm_interval
             started = time.monotonic()
             if self.static_image_b64:
                 seq, img = self.frames_seen + 1, self.static_image_b64
@@ -66,6 +103,8 @@ class Loop:
                     self.observations.append(text)
                     self.last_image_b64 = img
                     log.info("[see] %s", text)
+                    if self.console:
+                        self.console.event("see", text)
                     self._maybe_escalate()
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(0.0, interval - elapsed))
@@ -78,7 +117,7 @@ class Loop:
             return
         if self._cloud_task and not self._cloud_task.done():
             return
-        if time.monotonic() - self._last_cloud < self.cfg.cloud.min_interval_s:
+        if time.monotonic() - self._last_cloud < self.cloud_min_interval:
             return
         self._last_cloud = time.monotonic()
         self._cloud_task = asyncio.create_task(self._think())
@@ -117,6 +156,111 @@ class Loop:
         else:
             self.robot.stop()
 
+    # ---------------- runtime reconfiguration ----------------
+
+    # Keys the agent may change, mapped to (coercion, applier). Anything not
+    # listed here is rejected by tools.SETTABLE before it ever gets this far.
+    def apply_setting(self, key: str, value: str) -> dict:
+        try:
+            if key == "vlm_interval":
+                v = max(0.2, float(value))
+                self.vlm_interval = v
+            elif key == "cloud_min_interval":
+                v = max(1.0, float(value))
+                self.cloud_min_interval = v
+            elif key in ("cam_width", "cam_height"):
+                v = int(value)
+                if not 64 <= v <= 4096:
+                    return {"ok": False, "error": "must be between 64 and 4096"}
+                setattr(self, key, v)
+                self._restart_camera()
+            else:
+                return {"ok": False, "error": f"{key!r} is not settable"}
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": f"bad value for {key}: {exc}"}
+        return {"ok": True, "key": key, "value": v}
+
+    def _restart_camera(self) -> None:
+        """Camera geometry is fixed at open time, so a resize means a reopen."""
+        if self.static_image_b64:
+            return
+        with contextlib.suppress(Exception):
+            self.camera.stop()
+        self.camera = build_camera(
+            self.cfg.camera.device, self.cam_width,
+            self.cam_height, self.cfg.camera.fps,
+        )
+        self.toolbox._camera = self.camera
+        self.camera.start()
+
+    # ---------------- conversational agent ----------------
+
+    async def instruct(self, text: str, with_frame: bool = True) -> dict:
+        """Run one instruction through the cloud agent with tools available."""
+        frame = None
+        if with_frame and self.cfg.cloud.send_frames:
+            frame = self.last_image_b64
+            if frame is None and not self.static_image_b64:
+                _, frame = self.camera.latest_jpeg_b64()
+            frame = frame or self.static_image_b64
+        result = await self.agent.run(text, image_b64=frame)
+        if not result.get("ok"):
+            log.warning("[agent] %s", result.get("error", "failed"))
+            if self.console:
+                self.console.event("err", f"agent: {result.get('error', 'failed')}")
+        reply = result.get("reply", "")
+        if reply:
+            log.info("[agent] %s", reply)
+            self.say(reply)
+        return result
+
+    # ---------------- voice command and control ----------------
+
+    async def listen_forever(self) -> None:
+        """Mic -> transcript -> wake word -> agent -> spoken reply.
+
+        next_utterance() blocks on the arecord pipe, so it runs in a worker
+        thread; the perception loop keeps its cadence regardless.
+        """
+        v = self.voice
+        if v is None:
+            return
+        if not v.available:
+            log.warning("voice enabled but no mic/STT backend - voice control disabled")
+            return
+        v.start()
+        wake = self.cfg.voice.wake_word
+        log.info("voice control ready (wake word: %r)", wake or "<always on>")
+        try:
+            while not self._stop.is_set():
+                text = await asyncio.to_thread(v.next_utterance)
+                if not text:
+                    continue
+                log.info("[hear] %s", text)
+                if self.console:
+                    self.console.event("hear", f"heard: {text}")
+                command = match_wake_word(text, wake)
+                if command is None:
+                    self.transcript.append({"heard": text, "acted": False})
+                    continue
+                if not command:
+                    self.say("I'm listening.")
+                    continue
+                self.transcript.append({"heard": text, "acted": True})
+                await self.instruct(command)
+        finally:
+            v.stop()
+
+    def say(self, text: str) -> None:
+        """Speak, with the mic gated so the robot does not transcribe itself."""
+        if self.voice:
+            self.voice.mute(True)
+        try:
+            self.speaker.say(text)
+        finally:
+            if self.voice:
+                self.voice.mute(False)
+
     # ---------------- lifecycle ----------------
 
     async def status_forever(self) -> None:
@@ -141,10 +285,14 @@ class Loop:
             "cloud provider=%s enabled=%s send_frames=%s",
             self.cfg.cloud.provider, self.cloud.enabled, self.cfg.cloud.send_frames,
         )
+        if self.console is not None:
+            self.console.start()
         tasks = [
             asyncio.create_task(self.perceive_forever()),
             asyncio.create_task(self.status_forever()),
         ]
+        if self.voice is not None:
+            tasks.append(asyncio.create_task(self.listen_forever()))
         try:
             await self._stop.wait()
         finally:
@@ -155,6 +303,9 @@ class Loop:
             for t in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
+            if self.console is not None:
+                self.console.stop()
+            self.guard.close()
             self.robot.stop()
             if not self.static_image_b64:
                 self.camera.stop()
@@ -171,8 +322,23 @@ async def _amain(argv=None) -> int:
     p.add_argument("--image", help="use a still image file instead of a camera")
     p.add_argument("--duration", type=float, default=0.0,
                    help="run the continuous loop for N seconds, then exit (0 = forever)")
+    p.add_argument("--say", metavar="TEXT",
+                   help="run one instruction through the cloud agent, then exit")
+    p.add_argument("--voice", action="store_true", help="enable spoken command and control")
+    p.add_argument("--console", action="store_true", help="serve the browser console")
+    p.add_argument("--console-port", type=int, help="console port (default 8080)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
+
+    # CLI flags are just a friendlier way to set the environment the frozen
+    # config reads, so there is exactly one place a setting comes from.
+    import os
+    if args.voice:
+        os.environ["JETTANK_VOICE"] = "1"
+    if args.console or args.console_port:
+        os.environ["JETTANK_CONSOLE"] = "1"
+    if args.console_port:
+        os.environ["JETTANK_CONSOLE_PORT"] = str(args.console_port)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -209,6 +375,24 @@ async def _amain(argv=None) -> int:
             log.info("[plan] %s", await loop.cloud.think([text], image_b64=frame))
         if not static:
             loop.camera.stop()
+        await loop.vlm.aclose()
+        await loop.cloud.aclose()
+        return 0
+
+    if args.say:
+        if not loop.cloud.enabled:
+            log.error("no cloud provider configured; set JETTANK_CLOUD_PROVIDER")
+            return 1
+        if static is None:
+            loop.camera.start()
+            await asyncio.sleep(1.0)
+        result = await loop.instruct(args.say)
+        if result.get("tools_used"):
+            log.info("[tool] %s", ", ".join(result["tools_used"]))
+        print(result.get("reply") or f"(no reply: {result.get('error', 'unknown')})")
+        if static is None:
+            loop.camera.stop()
+        loop.guard.close()
         await loop.vlm.aclose()
         await loop.cloud.aclose()
         return 0

@@ -13,6 +13,14 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+# Imported lazily via a holder so cloud.py has no hard dependency on the robot
+# side of the codebase (keeps the stubbed transport tests working).
+TOOL_SCHEMAS_REF: list = [[]]
+
+
+def register_tools(schemas: list) -> None:
+    TOOL_SCHEMAS_REF[0] = schemas
+
 SYSTEM_PROMPT = (
     "You are the high-level planner for a small tracked robot (Yahboom Jettank on a "
     "Jetson Orin Nano). A local vision model reports what the camera sees, and you may "
@@ -93,6 +101,31 @@ class CloudAgent:
             return None
         return self._parse(raw)
 
+    async def _messages(self, messages: list[dict], tools: list[dict] | None = None,
+                        system: str | None = None) -> dict | None:
+        """Raw Messages API call returning the parsed response, or None on failure."""
+        body: dict = {
+            "model": self._model,
+            "max_tokens": self._max_tokens,
+            "system": system or SYSTEM_PROMPT,
+            "messages": messages,
+        }
+        if tools:
+            body["tools"] = tools
+        try:
+            r = await self._client.post(
+                f"{self._base}/v1/messages",
+                headers={"x-api-key": self._key or "",
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json=body,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:  # noqa: BLE001 - cloud is best-effort
+            log.warning("cloud messages call failed: %s", exc)
+            return None
+
     async def _anthropic(self, user: str, image_b64: str | None = None) -> str:
         content: list[dict] = []
         if image_b64:
@@ -170,3 +203,85 @@ class CloudAgent:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+AGENT_SYSTEM_PROMPT = (
+    "You are the operator of a small tracked robot (a Yahboom Jettank on a Jetson Orin Nano). "
+    "You can see through its camera, speak through its speaker, aim its pan/tilt camera, drive "
+    "its treads, enrol and recognise faces, and adjust a few runtime settings.\n\n"
+    "You are NOT the safety system. An on-board guard clamps speeds, stops the robot if you go "
+    "quiet, and can refuse motion outright. If a drive call is refused because motion is "
+    "disabled, accept it and say so - do not retry in a loop.\n\n"
+    "Be useful and concrete. Prefer looking before moving. When enrolling a face, tell the person "
+    "what to do, capture, then confirm. Keep spoken output short and natural - it is read aloud.\n\n"
+    "Call get_status first if you are unsure of the robot's state."
+)
+
+
+class AgentSession:
+    """Runs a tool-use conversation between the cloud model and the robot.
+
+    Kept separate from `CloudAgent.think` so the fast perception loop stays a
+    simple one-shot call; this is the slower, interactive path.
+    """
+
+    def __init__(self, agent: "CloudAgent", toolbox, max_turns: int = 8) -> None:
+        self._agent = agent
+        self._tools = toolbox
+        self._max_turns = max_turns
+        self.transcript: list[dict] = []
+
+    async def run(self, instruction: str, image_b64: str | None = None) -> dict:
+        """Give the model an instruction; let it drive until it is done."""
+        if not self._agent.enabled:
+            return {"ok": False, "error": "cloud agent is not configured"}
+
+        content: list[dict] = []
+        if image_b64:
+            content.append({
+                "type": "image",
+                "source": {"type": "base64",
+                           "media_type": self._agent._media_type(image_b64),
+                           "data": image_b64},
+            })
+        content.append({"type": "text", "text": instruction})
+        messages: list[dict] = [{"role": "user", "content": content}]
+
+        used: list[str] = []
+        for turn in range(self._max_turns):
+            reply = await self._agent._messages(messages, tools=TOOL_SCHEMAS_REF[0],
+                                                system=AGENT_SYSTEM_PROMPT)
+            if reply is None:
+                return {"ok": False, "error": "cloud call failed", "tools_used": used}
+
+            blocks = reply.get("content", [])
+            messages.append({"role": "assistant", "content": blocks})
+            calls = [b for b in blocks if b.get("type") == "tool_use"]
+            said = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+
+            if not calls:
+                return {"ok": True, "reply": said, "tools_used": used, "turns": turn + 1}
+
+            results = []
+            for call in calls:
+                name, args = call.get("name", ""), call.get("input", {}) or {}
+                log.info("[agent] tool %s(%s)", name, args)
+                out = self._tools.dispatch(name, args)
+                used.append(name)
+                # Images come back as a real image block so the model can look at them.
+                if name == "capture_image" and out.get("ok") and out.get("image_b64"):
+                    payload: object = [
+                        {"type": "image",
+                         "source": {"type": "base64",
+                                    "media_type": self._agent._media_type(out["image_b64"]),
+                                    "data": out["image_b64"]}},
+                        {"type": "text", "text": "current camera view"},
+                    ]
+                else:
+                    payload = json.dumps(out)
+                results.append({"type": "tool_result", "tool_use_id": call.get("id"),
+                                "content": payload})
+            messages.append({"role": "user", "content": results})
+
+        return {"ok": False, "error": f"gave up after {self._max_turns} turns",
+                "tools_used": used}

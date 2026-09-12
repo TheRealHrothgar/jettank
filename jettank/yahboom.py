@@ -165,6 +165,14 @@ class YahboomRobot:
     def gripper(self, closed: bool) -> None:
         self.arm("grip", 20.0 if closed else 120.0)
 
+    # Pan/tilt IDs on the camera gimbal. Unverified against firmware 3.2, so
+    # these stay dry-run along with everything else motion-capable.
+    PAN_ID, TILT_ID = 1, 2
+
+    def look(self, pan: float, tilt: float) -> None:
+        self._send(Protocol.servo(self.PAN_ID, pan), f"look pan={pan:.1f}")
+        self._send(Protocol.servo(self.TILT_ID, tilt), f"look tilt={tilt:.1f}")
+
     def say(self, text: str) -> None:
         # The speaker is an ALSA device, not the expansion board.
         log.info("[speak] %s", text)

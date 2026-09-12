@@ -204,3 +204,86 @@ rewrites `ld.so.conf.d` and the `libcuda` symlinks every boot.
 
 **Performance:** prompt tokens scale with camera resolution and dominate cost.
 1280x720 gave 1278 prompt tokens (~73 s); **640x480 cut a full inference to ~9 s.**
+
+---
+
+## 9. Command and control
+
+Two ways to talk to the robot, both feeding the same cloud agent and the same
+toolbox. Neither can enable motion — see §10.
+
+### Voice (audio in, audio out)
+
+Audio is transcribed **on the device**; only the resulting text reaches the
+cloud. Capture shells out to `arecord`, so the USB mic just has to be a working
+ALSA device:
+
+```bash
+arecord -l                     # find the card; note the plughw:X,Y
+arecord -D default -f S16_LE -r 16000 -c 1 -d 3 /tmp/t.wav && aplay /tmp/t.wav
+```
+
+Speech-to-text backend, in preference order (`JETTANK_STT_BACKEND=auto`):
+
+```bash
+pip install faster-whisper     # CTranslate2; uses CUDA if the wheel has it
+# or point at a whisper.cpp build:
+export JETTANK_WHISPER_BIN=/opt/whisper.cpp/build/bin/whisper-cli
+export JETTANK_WHISPER_MODEL=/opt/whisper.cpp/models/ggml-base.en.bin
+```
+
+Text-to-speech is `espeak-ng` (`sudo apt install espeak-ng`). The mic is muted
+while the robot speaks, or it transcribes itself and talks in a loop.
+
+```bash
+python3 -m jettank.loop --voice
+```
+
+Utterances are segmented by an energy gate, not a neural VAD — cheap and good
+enough at arm's length. If the Jetson's own fan keeps triggering it, raise
+`JETTANK_MIC_THRESHOLD` (default 0.02). Only speech after the wake word
+(`JETTANK_WAKE_WORD`, default `hey tank`) becomes a command; set it empty for
+always-on, which you probably don't want in a shared room.
+
+### Browser console (visual)
+
+```bash
+python3 -m jettank.loop --console            # http://<jetson>:8080
+```
+
+Live MJPEG of the camera, a rolling feed of what the local VLM sees and what
+the mic heard, a box to type instructions, and the arm / disarm / **E-STOP**
+buttons. **No auth, no TLS** — LAN only.
+
+Both channels together:
+
+```bash
+python3 -m jettank.loop --voice --console
+```
+
+One-shot, no loop:
+
+```bash
+python3 -m jettank.loop --say "what do you see? then tell me who is in frame"
+```
+
+## 10. Why the agent cannot arm the motors
+
+After the tread runaway, motion is gated by `jettank/safety.py`:
+
+* motion is **off at startup** and stays off until a human arms it;
+* `MotionGuard.enable()` and `clear_estop()` are **not tools** — no prompt, no
+  jailbreak and no model mistake can reach them. They are reachable only from
+  the console (a surface someone is physically looking at) or from Python;
+* speeds are clamped to `MotionLimits` regardless of what is requested;
+* a watchdog thread halts the treads after ~1 s without a fresh command, or
+  ~3 s of continuous motion, whichever comes first.
+
+The agent is told this in its system prompt and told that a refused `drive` is
+a normal outcome, not an error to retry.
+
+**Still true as of this writing:** the expansion board's command set is
+unverified against firmware v3.2, so `YahboomRobot` stays in dry-run and
+encodes frames without transmitting. Arming motion in the console will not move
+anything until `arm_live()` is called — deliberately, until we have a library
+that matches the firmware.
