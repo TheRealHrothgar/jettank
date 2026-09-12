@@ -173,7 +173,10 @@ class Loop:
                 seq, img = self.frames_seen + 1, self.static_image_b64
             else:
                 seq, img = self.camera.latest_jpeg_b64()
-            if img:
+            # A vanished camera can still hand back a short or stale buffer,
+            # and the VLM answers that with a 500. Cheapest possible guard: a
+            # real JPEG starts with SOI and is never this small.
+            if img and len(img) > 1024:
                 self.frames_seen = seq
                 text = await self.vlm.describe(img)
                 if text:
@@ -512,6 +515,46 @@ class Loop:
             self.say("Reloaded." if bits else "Nothing had changed.")
         return {"ok": True, **result}
 
+    async def peripherals_forever(self) -> None:
+        """Reconnect the camera and mic when they reappear.
+
+        This robot gets its USB replugged constantly - swapping a LIDAR for a
+        flash drive, moving devices between ports to chase power. Requiring a
+        service restart every time turns a ten second physical change into a
+        twenty second reboot plus a lost conversation, and it is avoidable:
+        neither device needs anything but reopening.
+        """
+        import os
+
+        while not self._stop.is_set():
+            await asyncio.sleep(5.0)
+
+            # Camera: present on disk but handing back nothing usable.
+            if not self.static_image_b64:
+                _, img = self.camera.latest_jpeg_b64()
+                healthy = bool(img) and len(img) > 1024
+                if not healthy and os.path.exists(self.cfg.camera.device):
+                    log.info("[peripherals] camera looks dead but %s exists - reopening",
+                             self.cfg.camera.device)
+                    try:
+                        self._restart_camera()
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("camera reopen failed: %s", exc)
+
+            # Microphone: arecord exits when its device disappears.
+            v = self.voice
+            if v is not None and v.available:
+                proc = getattr(v, "_proc", None)
+                if proc is not None and proc.poll() is not None:
+                    log.info("[peripherals] microphone went away - reopening")
+                    try:
+                        v.stop()
+                        v.start()
+                        await asyncio.to_thread(v.calibrate)
+                        log.info("[peripherals] microphone back")
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("mic reopen failed: %s", exc)
+
     async def battery_forever(self) -> None:
         """Watch the pack and act before a brown-out corrupts the disk.
 
@@ -633,6 +676,7 @@ class Loop:
             asyncio.create_task(self.status_forever()),
             asyncio.create_task(self.watch_forever()),
             asyncio.create_task(self.battery_forever()),
+            asyncio.create_task(self.peripherals_forever()),
         ]
         if self.voice is not None:
             tasks.append(asyncio.create_task(self.listen_forever()))
