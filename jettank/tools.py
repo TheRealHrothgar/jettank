@@ -752,51 +752,99 @@ class Speaker:
                          Path(self._piper_voice).stem, time.monotonic() - t)
             return self._voice
 
+    # Playback buffering. Raw PCM into `aplay -t raw -` garbles speech at
+    # aplay's defaults: it sizes its ALSA buffer from the stream parameters and
+    # begins consuming immediately, so the first burst is playing before much
+    # has been synthesised, and it underruns. An underrun on this USB device
+    # does not sound like a click - it sounds like slurred, mispaced speech,
+    # which is why this read as a text problem for so long.
+    #
+    # The fix is not to buffer the whole utterance (that costs latency and
+    # memory for nothing); it is to give ALSA a real buffer and not start
+    # playing until there is enough audio to stay ahead of it. After that,
+    # writes to a blocking pipe self-pace: aplay consumes at exactly realtime,
+    # so the write blocks whenever we get ahead. No sleeping, no rate maths.
+    PREBUFFER_MS = int(os.environ.get("JETTANK_TTS_PREBUFFER_MS", "400"))
+    ALSA_BUFFER_US = int(os.environ.get("JETTANK_TTS_BUFFER_US", "1000000"))
+    ALSA_PERIOD_US = int(os.environ.get("JETTANK_TTS_PERIOD_US", "100000"))
+    WRITE_BLOCK_MS = 100
+
     def _speak_piper(self, text: str) -> dict:
-        """Synthesise the whole utterance, then play it as a single WAV.
+        """Stream to aplay, prebuffered so it never starves.
 
-        This used to stream raw PCM into `aplay -t raw -` chunk by chunk, to
-        start speaking sooner. It garbled the speech: fed raw, aplay uses tiny
-        default period and buffer sizes, and writing in large irregular bursts
-        underruns it - which sounds like slurred, mispaced nonsense rather than
-        an obvious dropout, so it was easy to mistake for a text problem.
-
-        Every side-by-side listening test that sounded correct was playing a
-        complete WAV. So that is what we do. Synthesis runs at roughly 0.15x
-        realtime on this board - about 0.6s for a four-second utterance - so
-        the latency this costs is small and the intelligibility is worth far
-        more than the head start.
+        Latency is one prebuffer (~400ms) rather than the whole utterance, and
+        nothing larger than that is ever held in memory.
         """
         voice = self._load_piper()
         syn = self._syn_config()
-        chunks = list(voice.synthesize(text, syn) if syn else voice.synthesize(text))
-        if not chunks:
-            return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
+        proc = None
+        pending = bytearray()
+        rate = 22050
+        channels = 1
+        written = 0
+        first = True
 
-        rate = getattr(chunks[0], "sample_rate", 22050)
-        channels = getattr(chunks[0], "sample_channels", 1)
-        gap = (self._silence(rate, self.SENTENCE_GAP_MS)
-               if self.SENTENCE_GAP_MS > 0 else b"")
-        pcm = gap.join(self._pcm_of(c) for c in chunks)
-        if not pcm:
-            return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
+        def start(rate: int, channels: int):
+            return subprocess.Popen(
+                ["aplay", "-q", "-D", self._device, "-t", "raw",
+                 "-f", "S16_LE", "-r", str(rate), "-c", str(channels),
+                 "--buffer-time", str(self.ALSA_BUFFER_US),
+                 "--period-time", str(self.ALSA_PERIOD_US)],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
 
-        wav = io.BytesIO()
-        with wave.open(wav, "wb") as w:
-            w.setnchannels(channels)
-            w.setsampwidth(2)
-            w.setframerate(rate)
-            w.writeframes(pcm)
+        def flush(proc, buf: bytearray, block: int) -> int:
+            """Write whole blocks; leave any remainder in buf."""
+            n = 0
+            while len(buf) >= block:
+                proc.stdin.write(bytes(buf[:block]))
+                del buf[:block]
+                n += block
+            return n
+
         try:
-            subprocess.run(["aplay", "-q", "-D", self._device], input=wav.getvalue(),
-                           timeout=max(30.0, len(pcm) / 2 / rate + 15),
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "playback timed out", "spoken_text": text}
-        except FileNotFoundError:
-            return {"ok": False, "error": "aplay not installed", "spoken_text": text}
+            for chunk in (voice.synthesize(text, syn) if syn
+                          else voice.synthesize(text)):
+                if first:
+                    rate = getattr(chunk, "sample_rate", 22050)
+                    channels = getattr(chunk, "sample_channels", 1)
+                    first = False
+                elif self.SENTENCE_GAP_MS > 0:
+                    pending += self._silence(rate, self.SENTENCE_GAP_MS)
+                pending += self._pcm_of(chunk)
+
+                prebuffer = 2 * channels * int(rate * self.PREBUFFER_MS / 1000)
+                if proc is None:
+                    if len(pending) < prebuffer:
+                        continue            # keep filling; do not start starved
+                    proc = start(rate, channels)
+                written += flush(proc, pending, 2 * channels *
+                                 int(rate * self.WRITE_BLOCK_MS / 1000))
+
+            if proc is None:                # utterance shorter than the prebuffer
+                if not pending:
+                    return {"ok": False, "error": "TTS produced no audio",
+                            "spoken_text": text}
+                proc = start(rate, channels)
+            if pending:
+                proc.stdin.write(bytes(pending))
+                written += len(pending)
+        except BrokenPipeError:
+            return {"ok": False, "spoken_text": text,
+                    "error": f"audio device {self._device} unavailable "
+                             f"(is something else using it?)"}
+        finally:
+            if proc is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    proc.stdin.close()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=max(30.0, written / 2 / max(rate, 1) + 15))
+
+        if not written:
+            return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
         return {"ok": True, "spoken_text": text,
-                "duration_s": round(len(pcm) / 2 / rate, 2)}
+                "duration_s": round(written / 2 / channels / rate, 2)}
 
     @staticmethod
     def _pcm_of(chunk) -> bytes:
