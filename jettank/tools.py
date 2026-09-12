@@ -795,6 +795,28 @@ class Speaker:
     ALSA_PERIOD_US = int(os.environ.get("JETTANK_TTS_PERIOD_US", "100000"))
     WRITE_BLOCK_MS = 100
 
+    # Set JETTANK_TTS_DUMP_DIR to capture exactly what is sent to aplay. Every
+    # reconstruction of a speech fault has sounded clean; the only way to stop
+    # guessing is to keep the real bytes from the run that actually failed.
+    DUMP_DIR = os.environ.get("JETTANK_TTS_DUMP_DIR", "")
+
+    def _dump(self, pcm: bytes, rate: int, channels: int, text: str) -> None:
+        if not self.DUMP_DIR or not pcm:
+            return
+        try:
+            d = Path(self.DUMP_DIR)
+            d.mkdir(parents=True, exist_ok=True)
+            stem = d / f"say-{int(time.time())}-{abs(hash(text)) % 10000:04d}"
+            with wave.open(str(stem) + ".wav", "wb") as w:
+                w.setnchannels(channels)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(pcm)
+            (stem.with_suffix(".txt")).write_text(text)
+            log.info("dumped speech to %s.wav (%.1fs)", stem, len(pcm) / 2 / channels / rate)
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never break speech
+            log.debug("speech dump failed: %s", exc)
+
     def _speak_piper(self, text: str) -> dict:
         """Stream to aplay, prebuffered so it never starves.
 
@@ -809,6 +831,7 @@ class Speaker:
         channels = 1
         written = 0
         first = True
+        dumped = bytearray() if self.DUMP_DIR else None
 
         def start(rate: int, channels: int):
             return subprocess.Popen(
@@ -824,7 +847,10 @@ class Speaker:
             """Write whole blocks; leave any remainder in buf."""
             n = 0
             while len(buf) >= block:
-                proc.stdin.write(bytes(buf[:block]))
+                chunk = bytes(buf[:block])
+                proc.stdin.write(chunk)
+                if dumped is not None:
+                    dumped += chunk
                 del buf[:block]
                 n += block
             return n
@@ -865,6 +891,8 @@ class Speaker:
                     proc.stdin.write(self._silence(rate, lead))
             if pending:
                 proc.stdin.write(bytes(pending))
+                if dumped is not None:
+                    dumped += bytes(pending)
                 written += len(pending)
         except BrokenPipeError:
             return {"ok": False, "spoken_text": text,
@@ -882,6 +910,8 @@ class Speaker:
             return {"ok": False, "spoken_text": text, "aborted": True,
                     "error": "speech interrupted"}
 
+        if dumped is not None:
+            self._dump(bytes(dumped), rate, channels, text)
         if not written:
             return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
         self._last_spoke = time.monotonic()

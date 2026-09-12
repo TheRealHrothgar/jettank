@@ -366,6 +366,27 @@ check("the name inside another word does not match",
       match_wake_word("thank you very much", "hank") is None)
 check("a longer wake phrase wins over a bare name",
       match_wake_word("hey hank look left", "hank,hey hank") == "look left")
+
+# Far-field speech in a noisy room: observed live, base.en rendered attempts to
+# address him as "hey hang", "Hanks", "hunk". He was listening the whole time
+# and simply never saw the name, which is indistinguishable from being deaf.
+W = "hey hank,hi hank,hank"
+check("mis-transcribed name still wakes him (hang)",
+      match_wake_word("hey hang can you hear me", W) == "can you hear me")
+check("mis-transcribed name still wakes him (hanks)",
+      match_wake_word("hanks can you move", W) == "can you move")
+check("mis-transcribed name still wakes him (hunk)",
+      match_wake_word("hunk what do you see", W) == "what do you see")
+
+# The blocklist is what makes fuzzy matching safe at all.
+check("'thank you' never wakes him", match_wake_word("thank you very much", W) is None)
+check("'thanks' never wakes him", match_wake_word("no thanks", W) is None)
+check("'think' never wakes him", match_wake_word("I think that is right", W) is None)
+check("ordinary speech never wakes him",
+      match_wake_word("can you move the box over there", W) is None)
+check("'bank' and 'rank' never wake him",
+      match_wake_word("go to the bank", W) is None
+      and match_wake_word("what is the rank", W) is None)
 check("no wake word means no command", match_wake_word("just chatting", "hey tank") is None)
 check("bare wake word yields empty command", match_wake_word("hey tank", "hey tank") == "")
 check("empty wake word is always-on", match_wake_word("  do the thing ", "") == "do the thing")

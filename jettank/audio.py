@@ -408,6 +408,41 @@ class VoiceListener:
 _FILLERS = {"um", "uh", "er", "ah", "so", "well", "okay", "ok", "hey", "hi",
             "hello", "please", "yeah", "and"}
 
+# Far-field speech in a noisy room defeats exact matching. Observed in a live
+# session, base.en rendered attempts to address him as "I think team", "hey
+# hey", and similar - he was listening the whole time and simply never saw the
+# name. So the name itself is matched by edit distance, not equality.
+#
+# The blocklist is the whole reason this is safe. "thank" is one edit from
+# "hank" and "thank you" is extremely common, so it must never match; same for
+# ordinary words that happen to land nearby.
+_NAME_BLOCK = {"thank", "thanks", "think", "thinks", "than", "that", "hand",
+               "hands", "happy", "have", "hard", "back", "black", "bank",
+               "rank", "ranks", "hankering"}
+
+
+def _close_enough(word: str, name: str, max_edits: int = 1) -> bool:
+    """Is `word` within `max_edits` of `name`? Short words are matched exactly.
+
+    Levenshtein, bounded and written out rather than pulled in, because one
+    function is cheaper than a dependency on the robot.
+    """
+    if word in _NAME_BLOCK:
+        return False
+    if abs(len(word) - len(name)) > max_edits:
+        return False
+    if len(name) <= 3:
+        return word == name
+    prev = list(range(len(name) + 1))
+    for i, wc in enumerate(word, 1):
+        cur = [i]
+        for j, nc in enumerate(name, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (wc != nc)))
+        if min(cur) > max_edits:
+            return False
+        prev = cur
+    return prev[-1] <= max_edits
+
 
 def match_wake_word(text: str, wake: str) -> str | None:
     """Return what was said after the wake phrase, or None if absent.
@@ -446,6 +481,17 @@ def match_wake_word(text: str, wake: str) -> str | None:
             continue
         if best is None or idx < best[0]:
             best = (idx, after)
+    if best is None:
+        # No exact phrase matched. Fall back to finding the name itself,
+        # allowing for mis-transcription - this is the difference between a
+        # robot that answers across a room and one that appears deaf.
+        names = {p.split()[-1] for p in phrases if p.split()}
+        words = norm.split()
+        for i, w in enumerate(words):
+            if any(_close_enough(w, n) for n in names):
+                best = (sum(len(x) + 1 for x in words[:i]),
+                        sum(len(x) + 1 for x in words[:i + 1]) - 1)
+                break
     if best is None:
         return None
     # Keep what was said on BOTH sides of the name, not just after it. People
