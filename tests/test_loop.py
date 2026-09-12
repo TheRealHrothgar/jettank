@@ -306,6 +306,41 @@ check("set_config accepts allowed keys", tb.dispatch("set_config", {"key": "vlm_
 check("set_config reached the loop", fl.applied == [("vlm_interval", "3")])
 guard2.close()
 
+# ---------- the autonomous path is gated too ----------
+print("\nAutonomous plan gating")
+from jettank.loop import Loop  # noqa: E402
+
+
+class PlanLoop:
+    """Just enough Loop to exercise _apply without touching hardware."""
+    _MOVES = Loop._MOVES
+    _apply = Loop._apply
+
+    def __init__(self, guard, robot):
+        self.guard, self.robot, self.spoken = guard, robot, []
+
+    def say(self, text):
+        self.spoken.append(text)
+
+
+rb4 = RecordingRobot()
+guard4 = MotionGuard(rb4, MotionLimits(timeout_s=99, max_run_s=99), enabled=False)
+pl = PlanLoop(guard4, rb4)
+pl._apply({"action": "explore", "say": "off I go"})
+check("cloud plan cannot move a disarmed robot",
+      all(c == "stop" or c[0] == "look" for c in rb4.calls), str(rb4.calls))
+check("plan speech still happens", pl.spoken == ["off I go"])
+guard4.enable(True)
+rb4.calls.clear()
+pl._apply({"action": "retreat"})
+check("cloud plan moves once armed", any(c != "stop" for c in rb4.calls), str(rb4.calls))
+check("plan speed is clamped", all(
+    c == "stop" or max(abs(c[0]), abs(c[1])) <= 0.31 for c in rb4.calls), str(rb4.calls))
+rb4.calls.clear()
+pl._apply({"action": "idle"})
+check("idle stops", "stop" in rb4.calls)
+guard4.close()
+
 # ---------- voice ----------
 print("\nVoice command and control")
 from jettank.audio import _rms, match_wake_word  # noqa: E402

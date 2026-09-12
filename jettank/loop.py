@@ -136,25 +136,33 @@ class Loop:
         )
         self._apply(plan)
 
+    # Cloud plan -> (linear, angular). Everything motion-capable goes through
+    # MotionGuard, same as the agent's tools: the autonomous path must not be
+    # a way around the interlock the interactive path respects.
+    _MOVES = {
+        "explore": (0.25, 0.0),
+        "approach": (0.20, 0.0),
+        "retreat": (-0.25, 0.0),
+    }
+
     def _apply(self, plan: dict) -> None:
         """Translate a cloud plan into actuator calls. Conservative by default."""
         action = str(plan.get("action", "idle")).lower()
         say = str(plan.get("say", "")).strip()
         if say:
-            self.robot.say(say)
-        if action == "explore":
-            self.robot.drive(0.25, 0.25)
-        elif action == "approach":
-            self.robot.drive(0.2, 0.2)
-        elif action == "retreat":
-            self.robot.drive(-0.25, -0.25)
+            self.say(say)
+        if action in self._MOVES:
+            linear, angular = self._MOVES[action]
+            accepted, why = self.guard.drive(linear, angular, f"plan:{action}")
+            if not accepted:
+                log.info("[plan] %s not performed: %s", action, why)
         elif action == "grasp":
-            self.robot.stop()
+            self.guard.stop()
             self.robot.gripper(closed=True)
         elif action == "release":
             self.robot.gripper(closed=False)
         else:
-            self.robot.stop()
+            self.guard.stop()
 
     # ---------------- runtime reconfiguration ----------------
 
