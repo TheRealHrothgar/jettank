@@ -25,6 +25,7 @@ from .audio import Transcriber, VoiceListener, match_wake_word
 from .camera import build_camera
 from .codegen import BehaviorRunner, BehaviorStore, BehaviorWriter
 from .console import Console
+from .control import KILL_EXIT_CODE, classify
 from .sandbox import Sandbox, docker_available
 from .skills import SkillStore
 from .sysinfo import collect as collect_sysinfo, describe as describe_sysinfo
@@ -131,6 +132,8 @@ class Loop:
         # indistinguishable from one that is broken.
         self._awake_until = 0.0
         self._awake = False
+        self._work: asyncio.Task | None = None
+        self._killed = False
 
         self.transcript: deque[dict] = deque(maxlen=32)
         self.observations: deque[str] = deque(maxlen=32)
@@ -177,6 +180,10 @@ class Loop:
             return
         if time.monotonic() - self._last_cloud < self.cloud_min_interval:
             return
+        # Do not pay for cloud reasoning about an empty room that nobody asked
+        # about. Perception keeps running locally regardless.
+        if self.cfg.cloud.autonomy_when_awake_only and not self._awake:
+            return
         self._last_cloud = time.monotonic()
         self._cloud_task = asyncio.create_task(self._think())
 
@@ -208,7 +215,12 @@ class Loop:
         action = str(plan.get("action", "idle")).lower()
         say = str(plan.get("say", "")).strip()
         if say:
-            self.say(say)
+            # The planner runs on a timer, not in response to anyone. Speaking
+            # here talks over replies and narrates to an empty room.
+            if self.cfg.cloud.autonomy_speaks:
+                self.say(say)
+            else:
+                log.info("[plan] (unspoken) %s", say)
         if action in self._MOVES:
             linear, angular = self._MOVES[action]
             accepted, why = self.guard.drive(linear, angular, f"plan:{action}")
@@ -294,10 +306,12 @@ class Loop:
     # ---------------- voice command and control ----------------
 
     async def listen_forever(self) -> None:
-        """Mic -> transcript -> wake word -> agent -> spoken reply.
+        """Mic -> control words -> wake word -> agent, without ever going deaf.
 
-        next_utterance() blocks on the arecord pipe, so it runs in a worker
-        thread; the perception loop keeps its cadence regardless.
+        The instruction runs as a separate task rather than being awaited here.
+        That matters: awaiting it meant Hank stopped listening for the whole of
+        inference, so nothing could interrupt him - which makes a stop word
+        impossible by construction.
         """
         v = self.voice
         if v is None:
@@ -308,12 +322,7 @@ class Loop:
         v.start()
         await asyncio.to_thread(v.calibrate)
         wake = self.cfg.voice.wake_word
-        log.info("voice control ready (wake word: %r)", wake or "<always on>")
-        # People say "hey Hank" and then *pause* before the actual request, so
-        # VAD correctly ends the utterance on the wake word alone. Rather than
-        # fight that, a wake word opens a window during which the next thing
-        # said is taken as the command. The window also stays open briefly
-        # after a reply, so a follow-up does not need the wake word again.
+        log.info("voice control ready (wake word: %r; stop/kill always active)", wake)
         try:
             while not self._stop.is_set():
                 text = await asyncio.to_thread(v.next_utterance)
@@ -323,10 +332,20 @@ class Loop:
                 if self.console:
                     self.console.event("hear", f"heard: {text}")
 
+                # Control words are checked first and work whether Hank is
+                # awake, resting, thinking or speaking. An emergency control
+                # that only works in one mode is not one.
+                control = classify(text)
+                if control == "kill":
+                    await self._kill("voice")
+                    return
+                if control == "stop":
+                    self._interrupt("voice")
+                    continue
+
                 command = match_wake_word(text, wake)
                 if command is None:
                     if not self._awake:
-                        # Not addressed to him and he is resting: ignore it.
                         self.transcript.append({"heard": text, "acted": False})
                         continue
                     command = text.strip()   # awake: take it as addressed to him
@@ -334,20 +353,81 @@ class Loop:
                     self._wake()
 
                 if not command:
-                    # Wake word on its own. He is awake and waiting.
                     self._awake_until = time.monotonic() + self.cfg.voice.follow_up_s
                     self.say("I'm listening.")
                     continue
 
                 self.transcript.append({"heard": text, "acted": True})
-                self._awake_until = float("inf")     # do not rest mid-answer
-                try:
-                    await self.instruct(command, remember=True)
-                finally:
-                    self._awake_until = (time.monotonic()
-                                         + self.cfg.voice.conversation_timeout_s)
+                self._start_work(command)
         finally:
             v.stop()
+
+    # ---------------- work in flight ----------------
+
+    def _start_work(self, command: str) -> None:
+        """Run an instruction in the background so listening continues.
+
+        A new instruction while one is running replaces it - if you interrupt
+        Hank with a different question, you meant the new one.
+        """
+        if self._work and not self._work.done():
+            log.info("[voice] superseding the previous request")
+            self._cancel_work()
+        self._awake_until = time.monotonic() + self.cfg.voice.conversation_timeout_s
+        self._work = asyncio.create_task(self._run_work(command))
+
+    async def _run_work(self, command: str) -> None:
+        try:
+            await self.instruct(command, remember=True)
+        except asyncio.CancelledError:
+            log.info("[voice] request cancelled")
+            raise
+        finally:
+            # Extend the window from when the answer *finished*, not when it
+            # was asked, so a long task does not eat the follow-up window.
+            self._awake_until = max(
+                self._awake_until,
+                time.monotonic() + self.cfg.voice.conversation_timeout_s)
+
+    def _cancel_work(self) -> None:
+        if self._work and not self._work.done():
+            self._work.cancel()
+        self._work = None
+
+    def _interrupt(self, source: str) -> None:
+        """STOP: abandon what is in flight, keep listening.
+
+        Deliberately does not change the wake state. Saying stop is engagement,
+        not dismissal - going deaf immediately afterwards would be wrong.
+        """
+        log.info("[control] STOP from %s", source)
+        if self.console:
+            self.console.event("err", "STOP - cancelled in-flight work")
+        self.speaker.abort()          # cut speech mid-sentence
+        self.guard.stop()             # and halt motion
+        self._cancel_work()
+        self._awake_until = max(self._awake_until,
+                                time.monotonic() + self.cfg.voice.follow_up_s)
+
+    async def _kill(self, source: str) -> None:
+        """KILL: stop the process in a way systemd will not undo.
+
+        Exits with KILL_EXIT_CODE, which the unit lists in
+        RestartPreventExitStatus. Coming back is then a deliberate shell
+        action - `sudo systemctl start hank` - which is the point: a kill
+        switch that the machine can reverse on its own is not a kill switch.
+        """
+        log.warning("[control] KILL from %s - shutting down", source)
+        if self.console:
+            self.console.event("err", "KILL - shutting down; restart from a shell")
+        self.guard.estop("kill word")
+        self._cancel_work()
+        self.speaker.abort()
+        # Said synchronously, before teardown, so it is actually heard.
+        with contextlib.suppress(Exception):
+            self.speaker.say("Shutting down. You will have to restart me from a terminal.")
+        self._killed = True
+        self.request_stop()
 
     def _wake(self) -> None:
         self._awake = True
@@ -368,7 +448,10 @@ class Loop:
                 continue
             self._awake = False
             self._awake_until = 0.0
-            self.agent.reset()          # forget the conversation with the sleep
+            # Resting changes how Hank LISTENS, nothing else. Anything already
+            # running - a behaviour, an agent turn, a long capture - continues
+            # and still reports when it finishes. Only STOP cancels work.
+            self.agent.reset()          # forget the conversation, not the task
             log.info("[voice] resting - wake word required again")
             if self.console:
                 self.console.event("agent", "resting; say the wake word to start again")
@@ -531,7 +614,9 @@ async def _amain(argv=None) -> int:
     if args.duration > 0:
         running.call_later(args.duration, loop.request_stop)
     await loop.run()
-    return 0
+    # A kill word exits with a code the unit lists in RestartPreventExitStatus,
+    # so systemd leaves it down until a human starts it from a shell.
+    return KILL_EXIT_CODE if loop._killed else 0
 
 
 def main() -> int:

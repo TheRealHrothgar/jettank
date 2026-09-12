@@ -316,8 +316,9 @@ class PlanLoop:
     _MOVES = Loop._MOVES
     _apply = Loop._apply
 
-    def __init__(self, guard, robot):
+    def __init__(self, guard, robot, speaks=True):
         self.guard, self.robot, self.spoken = guard, robot, []
+        self.cfg = type("C", (), {"cloud": type("D", (), {"autonomy_speaks": speaks})()})()
 
     def say(self, text):
         self.spoken.append(text)
@@ -329,7 +330,12 @@ pl = PlanLoop(guard4, rb4)
 pl._apply({"action": "explore", "say": "off I go"})
 check("cloud plan cannot move a disarmed robot",
       all(c == "stop" or c[0] == "look" for c in rb4.calls), str(rb4.calls))
-check("plan speech still happens", pl.spoken == ["off I go"])
+check("plan speech still happens when autonomy may speak", pl.spoken == ["off I go"])
+
+# The planner runs on a timer, so by default it must not talk to an empty room.
+quiet = PlanLoop(guard4, rb4, speaks=False)
+quiet._apply({"action": "idle", "say": "heading towards the light"})
+check("autonomous planner is silent by default", quiet.spoken == [], str(quiet.spoken))
 guard4.enable(True)
 rb4.calls.clear()
 pl._apply({"action": "retreat"})
@@ -413,6 +419,50 @@ VoiceListener.__init__(v3, device="plughw:0,0",
 v3._proc = FakeMic("q" * 60)
 v3.calibrate(1.0)
 check("a quiet room never lowers the gate", v3.threshold == 0.05, str(v3.threshold))
+
+# ---------- control words ----------
+print("\nControl words (Hank Halt / Hank Override)")
+from jettank.control import KILL_EXIT_CODE, KILL_PHRASES, classify, normalise  # noqa: E402
+
+check("hank halt stops", classify("Hank halt!") == "stop")
+check("halt hank stops", classify("halt hank") == "stop")
+check("hank override kills", classify("Hank Override.") == "kill")
+check("override hank kills", classify("override hank") == "kill")
+check("a leading filler is ignored", classify("hey Hank, halt") == "stop")
+check("case and punctuation do not matter", classify("HANK,  HALT!!") == "stop")
+
+# Whole-utterance only: a control word inside a sentence must not fire.
+check("halt inside a sentence does nothing", classify("I told him to halt") is None)
+check("override inside a sentence does nothing",
+      classify("Hank override the camera settings") is None)
+check("bare halt does nothing", classify("halt") is None)
+check("bare override does nothing", classify("override") is None)
+check("plain stop is not a control word", classify("stop") is None)
+check("plain kill is not a control word", classify("kill") is None)
+check("an ordinary request is not a control word",
+      classify("hey hank what do you see") is None)
+check("empty input is safe", classify("") is None and classify(None) is None)
+
+# The lists are asymmetric on purpose: a false KILL costs a trip to a terminal,
+# a false STOP costs one cancelled request.
+check("stop tolerates mis-transcription", classify("Hank, hold.") == "stop")
+check("kill tolerates nothing extra", classify("hank overide") is None)
+check("kill has few phrasings", len(KILL_PHRASES) <= 3, str(KILL_PHRASES))
+check("stop and kill never overlap",
+      not (set(KILL_PHRASES) & set(__import__("jettank.control", fromlist=["x"]).STOP_PHRASES)))
+
+# If both were somehow heard, the safer reading wins.
+check("kill wins a tie", classify("hank override") == "kill")
+
+check("normalise strips fillers and punctuation",
+      normalise("  Um, okay, Hank halt!! ") == "hank halt",
+      normalise("  Um, okay, Hank halt!! "))
+check("kill exit code is what the unit prevents restart on", KILL_EXIT_CODE == 42)
+
+unit = (ROOT / "deploy" / "hank.service").read_text()
+check("the service honours the kill exit code",
+      "RestartPreventExitStatus=42" in unit)
+check("the service would otherwise restart", "Restart=always" in unit)
 
 # ---------- conversation: wake, continue, rest ----------
 print("\nConversation (wake, continue, rest)")
@@ -615,6 +665,8 @@ class SilentSpeaker:
         self._s._device = "null"
         self._s._piper_voice = None
         self._s._narrator = None
+        self._s._abort = __import__("threading").Event()
+        self._s._playing = None
 
     def say(self, t):
         from jettank.tools import Speaker

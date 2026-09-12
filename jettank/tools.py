@@ -661,6 +661,11 @@ class Speaker:
         # mechanical fallback when the narrator is off or unreachable.
         self._narrator = narrator
         self._last_spoke = 0.0
+        # The aplay process currently playing, so speech can be cut off
+        # mid-sentence. Without this, "stop" would have to wait politely for
+        # Hank to finish saying whatever prompted it.
+        self._playing: subprocess.Popen | None = None
+        self._abort = threading.Event()
         self._device = pick_speaker(device)
         self._engine: str | None = None
         self._piper_voice = self._find_voice(voice)
@@ -824,6 +829,9 @@ class Speaker:
         try:
             for chunk in (voice.synthesize(text, syn) if syn
                           else voice.synthesize(text)):
+                if self._abort.is_set():
+                    return {"ok": False, "spoken_text": text, "aborted": True,
+                            "error": "speech interrupted"}
                 if first:
                     rate = getattr(chunk, "sample_rate", 22050)
                     channels = getattr(chunk, "sample_channels", 1)
@@ -840,6 +848,7 @@ class Speaker:
                     lead = self._lead_in_ms()
                     if lead > 0:
                         proc.stdin.write(self._silence(rate, lead))
+                self._playing = proc
                 written += flush(proc, pending, 2 * channels *
                                  int(rate * self.WRITE_BLOCK_MS / 1000))
 
@@ -864,6 +873,11 @@ class Speaker:
                     proc.stdin.close()
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=max(30.0, written / 2 / max(rate, 1) + 15))
+            self._playing = None
+
+        if self._abort.is_set():
+            return {"ok": False, "spoken_text": text, "aborted": True,
+                    "error": "speech interrupted"}
 
         if not written:
             return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
@@ -883,7 +897,18 @@ class Speaker:
         return subprocess.run([self._engine, "--stdout", text],
                               capture_output=True, timeout=30).stdout
 
+    def abort(self) -> bool:
+        """Cut off speech immediately. Safe to call from any thread."""
+        self._abort.set()
+        proc = self._playing
+        if proc is None or proc.poll() is not None:
+            return False
+        with contextlib.suppress(Exception):
+            proc.kill()
+        return True
+
     def say(self, text: str) -> dict:
+        self._abort.clear()
         if self._narrator is not None:
             try:
                 text = self._narrator.narrate(str(text))

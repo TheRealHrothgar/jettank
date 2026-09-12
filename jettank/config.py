@@ -89,6 +89,17 @@ class CloudConfig:
     # Generated code needs room for a whole module.
     codegen_max_tokens: int = field(
         default_factory=lambda: _env_i("JETTANK_CODEGEN_MAX_TOKENS", 8192))
+    # The autonomous planner runs on a timer whether or not anyone is talking
+    # to Hank. Letting it speak means he narrates the room to an empty room
+    # every few seconds, which is both irritating and a good way to miss the
+    # replies you actually asked for. Off by default: he speaks when spoken to.
+    autonomy_speaks: bool = field(
+        default_factory=lambda: _env_b("JETTANK_AUTONOMY_SPEAKS", False))
+    # Only escalate to the cloud while someone is actually in conversation.
+    # Idling at one Opus call with a frame every few seconds costs real money
+    # to describe an empty room to nobody.
+    autonomy_when_awake_only: bool = field(
+        default_factory=lambda: _env_b("JETTANK_AUTONOMY_AWAKE_ONLY", True))
     # Send the camera frame itself, not just the local VLM's text description.
     # Better fine-detail reasoning, at the cost of imagery leaving the device.
     send_frames: bool = field(default_factory=lambda: _env_b("JETTANK_CLOUD_SEND_FRAMES", True))

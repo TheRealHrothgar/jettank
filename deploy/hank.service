@@ -29,6 +29,10 @@ ExecStart=/home/jetson/jettank/.venv/bin/python3 -m jettank.loop
 
 Restart=always
 RestartSec=10
+# The voice kill word exits with this code. Without this line systemd would
+# restart Hank immediately and the kill switch would do nothing - recovery is
+# meant to require someone at a terminal.
+RestartPreventExitStatus=42
 # If it crash-loops, stop rather than thrash the audio device and the API.
 StartLimitIntervalSec=300
 StartLimitBurst=5

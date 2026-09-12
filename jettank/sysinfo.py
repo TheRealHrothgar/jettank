@@ -150,4 +150,11 @@ def describe(facts: dict) -> str:
     disk = facts.get("disk", {})
     if disk.get("free_gb"):
         lines.append(f"- {disk['free_gb']} GB of disk free.")
+
+    lines.append(
+        "- Two spoken controls override you and never reach you: 'Hank halt' "
+        "abandons whatever you are doing and stops you talking, and 'Hank "
+        "override' shuts you down until someone restarts you from a terminal. "
+        "If asked how to stop you, say those. Never treat them as a topic to "
+        "discuss mid-task - they are handled before you hear anything.")
     return "\n".join(lines)

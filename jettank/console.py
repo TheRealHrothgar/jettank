@@ -35,6 +35,7 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Hank the Tank</title>
  input[type=text]{width:100%;padding:8px;background:#000;color:#ddd;border:1px solid #444;font:inherit}
  button{padding:8px 14px;margin:8px 6px 0 0;background:#222;color:#ddd;border:1px solid #555;font:inherit;cursor:pointer}
  button.stop{background:#611;border-color:#a33;color:#fdd}
+ button.warn{background:#543;border-color:#a83;color:#fea}
  #stat{margin-top:10px;color:#999}
 </style>
 <h1>hank the tank &mdash; console</h1>
@@ -43,7 +44,8 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Hank the Tank</title>
   <div class=col>
     <div id=log></div>
     <form id=f><input type=text id=cmd placeholder="tell Hank something..." autocomplete=off autofocus></form>
-    <button type=button onclick="act('estop')" class=stop>E-STOP</button>
+    <button type=button onclick="act('interrupt')" class=warn>STOP (cancel)</button>
+    <button type=button onclick="act('estop')" class=stop>E-STOP (motion)</button>
     <button type=button onclick="act('arm')">arm motion</button>
     <button type=button onclick="act('disarm')">disarm</button>
     <div id=stat></div>
@@ -127,6 +129,11 @@ class Console:
 
     def control(self, action: str) -> str:
         g = self._loop.guard
+        if action == "interrupt":
+            # Same path as the spoken control word, so there is one
+            # implementation of "abandon what is running".
+            self._loop._interrupt("console")
+            return "cancelled in-flight work; still listening"
         if action == "estop":
             g.estop("console")
             self.event("err", "E-STOP latched from console")
