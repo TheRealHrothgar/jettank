@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from jettank.board import BoardReader                                   # noqa: E402
 from jettank.drive import (BoardLink, beep_frame, load_verification,    # noqa: E402
                            motor_frame, rgb_frame, save_verification,
-                           servo_frame)
+                           servo_frame, stop_frames)
 
 PULSE_S = 0.35          # how long a motor channel is driven
 PULSE_SPEED = 18        # of 100; enough to see, slow enough to stop
@@ -136,21 +136,20 @@ def main() -> int:
             return 0
 
         mapping: dict[int, str] = {}
-        for channel in (1, 2, 3, 4):
+        for channel in (1, 2):
             print(f"\n  channel {channel}: forward pulse, {PULSE_S}s at "
                   f"{PULSE_SPEED}/100")
             if not yes("  ready?"):
                 continue
-            speeds = [0, 0, 0, 0]
-            speeds[channel - 1] = PULSE_SPEED
             try:
-                link.send(motor_frame(*speeds))
+                link.send(motor_frame(channel, PULSE_SPEED))
                 time.sleep(PULSE_S)
             finally:
                 # Always, on every path, including an exception.
-                link.send(motor_frame(0, 0, 0, 0))
-                time.sleep(0.2)
-                link.send(motor_frame(0, 0, 0, 0))
+                for _ in range(2):
+                    for f in stop_frames():
+                        link.send(f)
+                    time.sleep(0.15)
             answer = ask("  which tread moved, and which way? "
                          "[left/right/both/nothing] + [fwd/back]", "nothing")
             if "left" in answer or "both" in answer:
@@ -164,8 +163,8 @@ def main() -> int:
         right = [c for c, side in mapping.items() if side == "right"]
         if left and right:
             results["motor"] = True
-            results["left_channels"] = left
-            results["right_channels"] = right
+            results["left_index"] = left[0]
+            results["right_index"] = right[0]
             results["invert_left"] = any(f"invert{c}" in mapping for c in left)
             results["invert_right"] = any(f"invert{c}" in mapping for c in right)
             print(f"\n  motors confirmed: left={left} right={right} "

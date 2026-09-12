@@ -1,31 +1,37 @@
-"""Motion commands for the Yahboom expansion board.
+"""Motion commands for the Yahboom expansion board (Transbot firmware).
 
 Separate from board.py on purpose. That module reads and is asserted by test to
 contain no write call at all; this one is the only place that transmits, so
 "can this code move the robot?" is answered by which file you are looking at.
 
-Encodings are the vendor library's, re-framed onto the wire format actually
-verified against this firmware:
+THE PROTOCOL, from Yahboom's own Transbot_Lib on the reference USB drive.
+Everything before this was reverse-engineered from telemetry plus the WRONG
+vendor library (Rosmaster), and that mismatch explains both the tread runaway
+and months of commands going nowhere:
 
-    vendor                          here
-    device id 0xFC                  0xFD          (observed in every frame)
-    checksum  sum + (257 - id)      plain sum     (validates; the vendor's does not)
-    length    len(cmd) - 1          identical     (this part the vendor got right)
+    board -> us   header FF FD   checksum: plain sum(frame[2:-1]) & 0xFF
+    us -> board   header FF FE   checksum: (sum(whole frame) + 3) & 0xFF
 
-So the payload layouts below are inherited, but the envelope is ours. That
-distinction matters: the envelope is confirmed, the payload meanings are not.
+The device id DIFFERS BY DIRECTION. The board reports as 0xFD and listens as
+0xFE. We had been writing 0xFD - the board was correctly ignoring every command
+we ever sent, which is why the beeper and the lights did nothing.
 
-WHAT IS AND IS NOT KNOWN
-Verified from telemetry: header, device id, length rule, checksum rule.
-NOT verified: that this firmware's function numbers mean what the vendor
-library says. FUNC 0x08 streams constantly and the vendor library has no case
-for it at all, which is direct evidence its numbering is at least incomplete.
+The function numbering is different again, and this is the dangerous part:
 
-Hence MOTOR_FUNC and friends are treated as hypotheses until an operator
-confirms each one with the treads off the ground, using tools/verify_motion.py.
-Until that file records a confirmation, `build()` refuses to hand out a live
-driver. This is not caution for its own sake: the last time these numbers were
-guessed, the treads ran away.
+    code   Rosmaster (what we assumed)   Transbot (what this board runs)
+    0x02   BEEP                          MOTION          <-- drives the robot
+    0x03   PWM_SERVO                     PWM_SERVO       (agree, by luck)
+    0x06   RGB_EFFECT                    BEEP
+    0x08   (absent)                      AUTO_REPORT     <-- the 25Hz stream
+    0x09   -                             MOTOR
+    0x10   MOTOR                         -
+
+0x08 is the clincher: the telemetry we decoded from the wire is AUTO_REPORT in
+Transbot and does not exist in Rosmaster at all. And note what 0x02 means here.
+Every "harmless beep" sent through the Rosmaster mapping was addressed to the
+MOTION function. That is the tread runaway, exactly.
+
+Motors are indexed 1-2 here, not 1-4: this board drives two treads directly.
 """
 from __future__ import annotations
 
@@ -37,8 +43,6 @@ import threading
 import time
 from pathlib import Path
 
-from .board import DEVICE_ID, HEADER, checksum
-
 log = logging.getLogger(__name__)
 
 # Where operator confirmations are recorded. Written only by
@@ -46,13 +50,24 @@ log = logging.getLogger(__name__)
 VERIFY_FILE = Path(os.environ.get(
     "JETTANK_MOTION_VERIFIED", Path.home() / ".jettank_motion.json"))
 
-# Hypotheses, from the vendor library. Confirmed individually before use.
-FUNC_BEEP = 0x02
+HEADER = 0xFF
+CMD_DEVICE_ID = 0xFE          # what the board LISTENS on (telemetry is 0xFD)
+CHECKSUM_SEED = 3             # Transbot_Lib: sum(cmd, 3) & 0xff
+
+# Transbot function codes. No longer hypotheses.
+FUNC_SET_PID = 0x01
+FUNC_MOTION = 0x02            # velocity + angular; MOVES THE ROBOT
 FUNC_PWM_SERVO = 0x03
-FUNC_RGB = 0x05
-FUNC_MOTOR = 0x10          # payload: 4 signed bytes, -100..100, motors 1-4
-FUNC_CAR_RUN = 0x11
-FUNC_MOTION = 0x12
+FUNC_RGB = 0x04
+FUNC_RGB_EFFECT = 0x05
+FUNC_BEEP = 0x06
+FUNC_BIG_LED = 0x07
+FUNC_AUTO_REPORT = 0x08
+FUNC_MOTOR = 0x09             # (index 1-2, int16 speed -100..100)
+FUNC_CAR_RUN = 0x0D
+FUNC_UART_SERVO = 0x20        # the arm's bus servos
+FUNC_ARM_CTRL = 0x23
+FUNC_VERSION = 0x51
 
 # Hard ceiling in the driver, below whatever MotionGuard allows. Two independent
 # limits, because this one survives even if the guard is misconfigured.
@@ -61,26 +76,29 @@ MAX_MOTOR = int(os.environ.get("JETTANK_MAX_MOTOR", "30"))      # of 100
 # The camera head is a different risk class from the treads and is gated
 # separately. Pan/tilt cannot drive the robot anywhere: worst case it points
 # the camera somewhere useless, which is visible and instantly reversible.
-# Treads can leave the table. So servos default to on and motors do not.
 SERVOS_DEFAULT_ON = os.environ.get("JETTANK_SERVOS", "1") not in ("0", "false", "no")
 
-# Angle limits, applied here as well as upstream. The gimbal has end stops and
-# driving a servo into one stalls it, which draws current and cooks it.
 PAN_LIMIT = int(os.environ.get("JETTANK_PAN_LIMIT", "80"))
 TILT_LIMIT = int(os.environ.get("JETTANK_TILT_LIMIT", "40"))
 
 
 def encode(func: int, payload: bytes) -> bytes:
-    """Frame a command using the verified envelope."""
-    length = len(payload) + 3
-    head = bytes((HEADER, DEVICE_ID, length, func)) + payload
-    return head + bytes((checksum(head),))
+    """Frame a command the way the board expects to receive one."""
+    length = len(payload) + 3          # matches Transbot_Lib's hardcoded lengths
+    head = bytes((HEADER, CMD_DEVICE_ID, length, func)) + payload
+    return head + bytes(((sum(head) + CHECKSUM_SEED) & 0xFF,))
 
 
-def motor_frame(m1: int, m2: int, m3: int, m4: int) -> bytes:
-    """Raw four-motor command. Values are clamped here as well as upstream."""
-    vals = [max(-MAX_MOTOR, min(MAX_MOTOR, int(v))) for v in (m1, m2, m3, m4)]
-    return encode(FUNC_MOTOR, struct.pack("4b", *vals))
+def motor_frame(index: int, speed: int) -> bytes:
+    """One tread. index is 1 or 2; speed is -100..100, clamped to MAX_MOTOR."""
+    spd = max(-MAX_MOTOR, min(MAX_MOTOR, int(speed)))
+    return encode(FUNC_MOTOR, bytes((max(1, min(int(index), 2)),))
+                  + struct.pack("<h", spd))
+
+
+def stop_frames() -> list[bytes]:
+    """Both treads to zero. A list because each motor is addressed separately."""
+    return [motor_frame(1, 0), motor_frame(2, 0)]
 
 
 def beep_frame(ms: int) -> bytes:
@@ -132,8 +150,9 @@ class BoardLink:
     def close(self) -> None:
         if self._ser is not None:
             # Always leave the motors commanded to zero, whatever happened.
-            with __import__("contextlib").suppress(Exception):
-                self.send(motor_frame(0, 0, 0, 0))
+            for frame in stop_frames():
+                with __import__("contextlib").suppress(Exception):
+                    self.send(frame)
             with __import__("contextlib").suppress(Exception):
                 self._ser.close()
             self._ser = None
@@ -153,13 +172,15 @@ class RosmasterDriver:
     def __init__(self, link: BoardLink, verification: dict | None = None) -> None:
         self._link = link
         self._v = verification if verification is not None else load_verification()
-        self.left_channels = tuple(self._v.get("left_channels", (1, 2)))
-        self.right_channels = tuple(self._v.get("right_channels", (3, 4)))
+        self.left_index = int(self._v.get("left_index", 1))
+        self.right_index = int(self._v.get("right_index", 2))
         self._invert_left = bool(self._v.get("invert_left", False))
         self._invert_right = bool(self._v.get("invert_right", False))
         self._last_cmd = 0.0
         self.pan = 0.0
         self.tilt = 0.0
+        self._pan_sign = 1 if self._v.get("pan_sign", 1) >= 0 else -1
+        self._tilt_sign = 1 if self._v.get("tilt_sign", 1) >= 0 else -1
 
     def confirmed(self, name: str) -> bool:
         # Servos are allowed without a recorded confirmation because the
@@ -177,12 +198,10 @@ class RosmasterDriver:
             return
         l = int(max(-1.0, min(1.0, left)) * MAX_MOTOR) * (-1 if self._invert_left else 1)
         r = int(max(-1.0, min(1.0, right)) * MAX_MOTOR) * (-1 if self._invert_right else 1)
-        m = [0, 0, 0, 0]
-        for ch in self.left_channels:
-            m[ch - 1] = l
-        for ch in self.right_channels:
-            m[ch - 1] = r
-        self._link.send(motor_frame(*m))
+        # This board addresses two treads directly, one frame each.
+        self._link.send(motor_frame(self.left_index, l))
+        time.sleep(0.01)
+        self._link.send(motor_frame(self.right_index, r))
         self._last_cmd = time.monotonic()
 
     def stop(self) -> None:
@@ -192,8 +211,9 @@ class RosmasterDriver:
         than useless. If the motor function number is wrong this is a no-op on
         a board that was never moving; if it is right, it stops.
         """
-        with __import__("contextlib").suppress(Exception):
-            self._link.send(motor_frame(0, 0, 0, 0))
+        for frame in stop_frames():
+            with __import__("contextlib").suppress(Exception):
+                self._link.send(frame)
 
     # ---- camera head ----
     def look(self, pan: float, tilt: float) -> None:
@@ -205,9 +225,14 @@ class RosmasterDriver:
         tilt_id = int(self._v.get("tilt_servo", 2))
         p = max(-PAN_LIMIT, min(PAN_LIMIT, float(pan)))
         t = max(-TILT_LIMIT, min(TILT_LIMIT, float(tilt)))
-        self._link.send(servo_frame(pan_id, int(90 + p)))
+        # Both axes are inverted relative to the servo's own numbering, checked
+        # against captured frames rather than assumed: raising the pan angle
+        # swings the view LEFT, and raising the tilt angle points DOWN. Hank's
+        # interface stays intuitive - positive pan is his right, positive tilt
+        # is up - and the inversion lives here.
+        self._link.send(servo_frame(pan_id, int(90 - p * self._pan_sign)))
         time.sleep(0.02)                     # the board drops back-to-back frames
-        self._link.send(servo_frame(tilt_id, int(90 - t)))
+        self._link.send(servo_frame(tilt_id, int(90 - t * self._tilt_sign)))
         self.pan, self.tilt = p, t
 
     def arm(self, joint: str, angle: float) -> None:
