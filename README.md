@@ -15,6 +15,49 @@ The fast loop owns the robot. The cloud only ever *suggests* — if it is slow,
 offline, or returns nonsense, the robot keeps perceiving and stays responsive.
 Every network path returns `None` on failure rather than raising.
 
+## Working directories
+
+Two trees, deliberately separate:
+
+| Path | Role |
+|---|---|
+| `~/jettank` | **operating tree** — what runs, what deploys to the robot. Edit here. |
+| `~/git/jettank` | **git repo** — what gets published. Never edit directly; it is overwritten. |
+
+The operating tree accumulates things that must never be published: the venv,
+61 MB Piper voice models, the face database, logs. Keeping the repo a separate
+directory means a stray file cannot be swept in by an over-broad `git add`.
+
+```bash
+./scripts/sync_git.sh      # operating tree -> git repo (refuses if it finds a secret)
+./scripts/deploy.sh        # operating tree -> the robot
+./scripts/deploy.sh --test # ...and run the test suite there
+```
+
+`sync_git.sh` greps the source for credential-*shaped* strings (`sk-ant-…`,
+`ghp_…`, `BEGIN … PRIVATE KEY`) and aborts before copying anything. It matches
+the shape of real credentials, not the words "key" or "password", so config
+field names and documentation do not trip it.
+
+**Edit in the operating tree, never in the repo.** `sync_git.sh` uses
+`rsync --delete`, so a change made only in `~/git/jettank` is silently
+reverted on the next sync.
+
+## Secrets
+
+Nothing secret is in either tree:
+
+| What | Where | Mode |
+|---|---|---|
+| Cloud API key | `~/.jettank.env` | 600 |
+| GitHub / GitLab PATs, Wi-Fi password | `~/git/.env` | 600 |
+| SSH key for the robot | `~/.ssh/jetson_ed25519` | 600 |
+| Face embeddings | `~/.jettank_faces.json` **on the robot** | 600 |
+
+All sit outside every git repo. `~/.jettank.env` is sourced by `run.sh` at
+runtime and is never deployed — the robot keeps its own copy. Face embeddings
+never leave the device; the cloud only ever sees names and confidences.
+
 ## Layout
 
     jettank/config.py   env-driven config, no secrets at import
