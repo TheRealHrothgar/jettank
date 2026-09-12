@@ -405,18 +405,58 @@ class VoiceListener:
             Path(path).unlink(missing_ok=True)
 
 
-def match_wake_word(text: str, wake: str) -> str | None:
-    """Return the command after the wake word, or None if it is absent.
+_FILLERS = {"um", "uh", "er", "ah", "so", "well", "okay", "ok", "hey", "hi",
+            "hello", "please", "yeah", "and"}
 
-    An empty wake word means always-on. Matching is loose on purpose: STT
-    routinely renders 'hey tank' as 'hey, tank.' or 'Hey Tank!'.
+
+def match_wake_word(text: str, wake: str) -> str | None:
+    """Return what was said after the wake phrase, or None if absent.
+
+    `wake` is a comma-separated list, because people do not use one fixed
+    phrase. Watching a live session, Hank was addressed as "Hi Hank", "How are
+    you doing Hank?" and just "Hank." within a minute, and ignored all of it
+    while waiting for exactly "hey hank" - which reads, to the person talking,
+    as a robot that is broken.
+
+    Empty means always-on. Matching is deliberately loose about punctuation and
+    case: speech-to-text renders the same phrase as "Hey, Hank!", "hey hank"
+    and "Hi Hank." in consecutive utterances.
     """
     if not wake:
         return text.strip()
     norm = "".join(c.lower() if c.isalnum() or c.isspace() else " " for c in text)
     norm = " ".join(norm.split())
-    key = " ".join(wake.lower().split())
-    idx = norm.find(key)
-    if idx < 0:
+    if not norm:
         return None
-    return norm[idx + len(key):].strip()
+
+    # Longest phrases first, so "hey hank" wins over a bare "hank" and the
+    # remainder is not left with a stray word.
+    phrases = sorted((" ".join(w.lower().split()) for w in wake.split(",") if w.strip()),
+                     key=len, reverse=True)
+    best: tuple[int, int] | None = None
+    for key in phrases:
+        idx = norm.find(key)
+        if idx < 0:
+            continue
+        # Must fall on word boundaries: "hank" should not match inside "thank".
+        before_ok = idx == 0 or norm[idx - 1] == " "
+        after = idx + len(key)
+        after_ok = after == len(norm) or norm[after] == " "
+        if not (before_ok and after_ok):
+            continue
+        if best is None or idx < best[0]:
+            best = (idx, after)
+    if best is None:
+        return None
+    # Keep what was said on BOTH sides of the name, not just after it. People
+    # put it at either end - "Hank, what do you see" and "what do you see,
+    # Hank" are the same request, and dropping the leading half turned the
+    # second into a bare wake word with the question thrown away.
+    command = " ".join((norm[:best[0]] + " " + norm[best[1]:]).split())
+    # Keeping the leading half means keeping its filler too.
+    while True:
+        head, _, rest = command.partition(" ")
+        if head in _FILLERS and rest:
+            command = rest
+            continue
+        return command

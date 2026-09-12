@@ -354,6 +354,18 @@ from jettank.audio import _rms, match_wake_word  # noqa: E402
 check("wake word strips punctuation", match_wake_word("Hey, Tank! drive forward", "hey tank") == "drive forward")
 check("wake word is case-insensitive", match_wake_word("HEY TANK stop", "hey tank") == "stop")
 check("wake word mid-sentence still matches", match_wake_word("um hey tank look left", "hey tank") == "look left")
+# People put his name at either end; both are the same request, and dropping
+# the leading half turned "what do you see, Hank" into a bare wake word.
+check("speech before the name is kept",
+      match_wake_word("what do you see hank", "hank") == "what do you see")
+check("speech on both sides is joined",
+      match_wake_word("hank can you look left", "hank") == "can you look left")
+check("a bare address yields no command",
+      match_wake_word("hey hank", "hey hank") == "")
+check("the name inside another word does not match",
+      match_wake_word("thank you very much", "hank") is None)
+check("a longer wake phrase wins over a bare name",
+      match_wake_word("hey hank look left", "hank,hey hank") == "look left")
 check("no wake word means no command", match_wake_word("just chatting", "hey tank") is None)
 check("bare wake word yields empty command", match_wake_word("hey tank", "hey tank") == "")
 check("empty wake word is always-on", match_wake_word("  do the thing ", "") == "do the thing")

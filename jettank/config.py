@@ -122,7 +122,14 @@ class VoiceConfig:
     stt_model: str = field(default_factory=lambda: _env("JETTANK_STT_MODEL", "base.en"))
     # Empty means always-on: every utterance becomes a command. A wake word is
     # strongly preferred on a robot that is also listening to a room.
-    wake_word: str = field(default_factory=lambda: _env("JETTANK_WAKE_WORD", "hey hank"))
+    # Comma-separated. People address him however they feel like, and
+    # speech-to-text mangles "hank" into "hang" and "hanks" routinely. A bare
+    # "hank" is included because that is how he actually gets addressed - the
+    # word-boundary check keeps it out of "thank you".
+    wake_word: str = field(default_factory=lambda: _env(
+        "JETTANK_WAKE_WORD",
+        "hey hank,hi hank,hello hank,okay hank,ok hank,hey hanks,hi hanks,"
+        "hey hang,hi hang,hank"))
     # Energy gate, 0..1. Raise it if the robot's own fans keep triggering it.
     threshold: float = field(default_factory=lambda: _env_f("JETTANK_MIC_THRESHOLD", 0.02))
     # Silero needs a real pause to call end-of-utterance. Too short and it

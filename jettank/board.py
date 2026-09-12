@@ -165,7 +165,9 @@ class BoardReader:
             try:
                 chunk = self._ser.read(128)
             except Exception as exc:  # noqa: BLE001
-                log.warning("board read failed (%s)", exc)
+                # A closed port during shutdown is expected, not a fault.
+                if not self._stop.is_set():
+                    log.warning("board read failed (%s)", exc)
                 return
             if not chunk:
                 continue
@@ -197,6 +199,10 @@ class BoardReader:
 
     def stop(self) -> None:
         self._stop.set()
+        # Set the flag before closing, so the reader thread knows the error it
+        # is about to see is our doing.
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
         if self._ser is not None:
             with __import__("contextlib").suppress(Exception):
                 self._ser.close()
