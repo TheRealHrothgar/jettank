@@ -10,3 +10,17 @@ __pycache__/
 .jettank.env
 *_faces.json
 voices/
+
+# Photos of the robot in situ: they show the family's home and the people in
+# it. Hank uses them locally for self-recognition; they do not get published.
+*.JPEG
+*.jpeg
+*.JPG
+*.jpg
+*.HEIC
+
+# Windows NTFS alternate-data-stream sidecars that ride along through WSL
+# (Zone.Identifier, endpoint-DLP tags). Never ours to publish.
+*:Zone.Identifier
+*:sec.endpointdlp
+*:*
