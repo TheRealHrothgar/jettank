@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 .venv/
 *.log
+
+# Never commit: API keys, biometric data, TTS voice models (61MB each)
+.env
+*.env
+!.env.example
+.jettank.env
+*_faces.json
+voices/
