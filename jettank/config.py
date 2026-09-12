@@ -117,9 +117,14 @@ class VoiceConfig:
     # Silero needs a real pause to call end-of-utterance. Too short and it
     # splits mid-sentence; too long and the robot feels sluggish.
     silence_ms: int = field(default_factory=lambda: _env_i("JETTANK_MIC_SILENCE_MS", 900))
-    # After the wake word (or a reply), accept the next utterance without
-    # needing the wake word again, so conversation flows.
-    follow_up_s: float = field(default_factory=lambda: _env_f("JETTANK_FOLLOW_UP", 12.0))
+    # Once woken, Hank stays in conversation and does not need the wake word
+    # again. The window restarts after every exchange, so a real back-and-forth
+    # never lapses mid-flow; this is the silence after which he rests.
+    conversation_timeout_s: float = field(
+        default_factory=lambda: _env_f("JETTANK_CONVERSATION_TIMEOUT", 90.0))
+    # Kept for the brief window right after a bare wake word, before anything
+    # has actually been asked.
+    follow_up_s: float = field(default_factory=lambda: _env_f("JETTANK_FOLLOW_UP", 20.0))
 
 
 @dataclass(frozen=True)

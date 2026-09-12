@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import random
 import threading
 import time
 from collections import deque
@@ -36,6 +37,15 @@ from .tools import TOOL_SCHEMAS, Speaker, ToolBox
 from .vlm import LocalVLM
 
 log = logging.getLogger("jettank")
+
+# Varied so it does not become wallpaper - the same sentence every time stops
+# being heard after a day.
+REST_PHRASES = [
+    "I'll rest here. Say hey Hank when you need me.",
+    "Going quiet. Just say hey Hank.",
+    "I'll stop listening now. Hey Hank brings me back.",
+    "Resting. Say hey Hank whenever.",
+]
 
 
 class Loop:
@@ -113,6 +123,14 @@ class Loop:
         self.agent = AgentSession(self.cloud, self.toolbox,
                                   max_tokens=cfg.cloud.agent_max_tokens,
                                   system_facts=self.system_facts)
+
+        # Conversation state. Hank is either resting (wake word required) or
+        # awake (everything he hears is addressed to him, and he remembers the
+        # exchange). He announces the transition back so it is never ambiguous
+        # which mode he is in - a robot that has silently stopped listening is
+        # indistinguishable from one that is broken.
+        self._awake_until = 0.0
+        self._awake = False
 
         self.transcript: deque[dict] = deque(maxlen=32)
         self.observations: deque[str] = deque(maxlen=32)
@@ -253,7 +271,8 @@ class Loop:
 
     # ---------------- conversational agent ----------------
 
-    async def instruct(self, text: str, with_frame: bool = True) -> dict:
+    async def instruct(self, text: str, with_frame: bool = True,
+                       remember: bool = False) -> dict:
         """Run one instruction through the cloud agent with tools available."""
         frame = None
         if with_frame and self.cfg.cloud.send_frames:
@@ -261,7 +280,7 @@ class Loop:
             if frame is None and not self.static_image_b64:
                 _, frame = self.camera.latest_jpeg_b64()
             frame = frame or self.static_image_b64
-        result = await self.agent.run(text, image_b64=frame)
+        result = await self.agent.run(text, image_b64=frame, remember=remember)
         if not result.get("ok"):
             log.warning("[agent] %s", result.get("error", "failed"))
             if self.console:
@@ -295,7 +314,6 @@ class Loop:
         # fight that, a wake word opens a window during which the next thing
         # said is taken as the command. The window also stays open briefly
         # after a reply, so a follow-up does not need the wake word again.
-        open_until = 0.0
         try:
             while not self._stop.is_set():
                 text = await asyncio.to_thread(v.next_utterance)
@@ -306,23 +324,55 @@ class Loop:
                     self.console.event("hear", f"heard: {text}")
 
                 command = match_wake_word(text, wake)
-                listening = time.monotonic() < open_until
                 if command is None:
-                    if not listening:
+                    if not self._awake:
+                        # Not addressed to him and he is resting: ignore it.
                         self.transcript.append({"heard": text, "acted": False})
                         continue
-                    command = text.strip()  # inside the window: no wake word needed
+                    command = text.strip()   # awake: take it as addressed to him
+                elif not self._awake:
+                    self._wake()
+
                 if not command:
-                    open_until = time.monotonic() + self.cfg.voice.follow_up_s
+                    # Wake word on its own. He is awake and waiting.
+                    self._awake_until = time.monotonic() + self.cfg.voice.follow_up_s
                     self.say("I'm listening.")
                     continue
 
                 self.transcript.append({"heard": text, "acted": True})
-                open_until = 0.0
-                await self.instruct(command)
-                open_until = time.monotonic() + self.cfg.voice.follow_up_s
+                self._awake_until = float("inf")     # do not rest mid-answer
+                try:
+                    await self.instruct(command, remember=True)
+                finally:
+                    self._awake_until = (time.monotonic()
+                                         + self.cfg.voice.conversation_timeout_s)
         finally:
             v.stop()
+
+    def _wake(self) -> None:
+        self._awake = True
+        log.info("[voice] awake - conversation open, no wake word needed")
+        if self.console:
+            self.console.event("agent", "awake, listening")
+
+    async def rest_watcher(self) -> None:
+        """Put Hank back to sleep after a quiet spell, out loud.
+
+        Announced rather than silent: the failure mode of a wake word is a
+        person talking to a robot that stopped listening some time ago, with
+        nothing to indicate when. One short line removes that ambiguity.
+        """
+        while not self._stop.is_set():
+            await asyncio.sleep(1.0)
+            if not self._awake or time.monotonic() < self._awake_until:
+                continue
+            self._awake = False
+            self._awake_until = 0.0
+            self.agent.reset()          # forget the conversation with the sleep
+            log.info("[voice] resting - wake word required again")
+            if self.console:
+                self.console.event("agent", "resting; say the wake word to start again")
+            self.say(random.choice(REST_PHRASES))
 
     def say(self, text: str) -> None:
         """Speak, with the mic gated so the robot does not transcribe itself."""
@@ -366,6 +416,7 @@ class Loop:
         ]
         if self.voice is not None:
             tasks.append(asyncio.create_task(self.listen_forever()))
+            tasks.append(asyncio.create_task(self.rest_watcher()))
         try:
             await self._stop.wait()
         finally:

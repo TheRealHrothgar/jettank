@@ -308,7 +308,7 @@ guard2.close()
 
 # ---------- the autonomous path is gated too ----------
 print("\nAutonomous plan gating")
-from jettank.loop import Loop  # noqa: E402
+from jettank.loop import REST_PHRASES, Loop  # noqa: E402
 
 
 class PlanLoop:
@@ -414,43 +414,125 @@ v3._proc = FakeMic("q" * 60)
 v3.calibrate(1.0)
 check("a quiet room never lowers the gate", v3.threshold == 0.05, str(v3.threshold))
 
-# ---------- wake window ----------
-print("\nWake window (pause after the wake word)")
+# ---------- conversation: wake, continue, rest ----------
+print("\nConversation (wake, continue, rest)")
 
 
-def conversation(utterances, wake="hey hank", follow_up=12.0, now=None):
-    """Replay utterances through the same decision logic listen_forever uses."""
-    acted, open_until, t = [], 0.0, 0.0
+def conversation(utterances, wake="hey hank", timeout=90.0, follow_up=20.0):
+    """Replay utterances through the same decision logic listen_forever uses.
+
+    Returns (commands_acted_on, rested_at_times).
+    """
+    acted, rested = [], []
+    awake, awake_until, t = False, 0.0, 0.0
     for text, dt in utterances:
+        # the rest watcher ticks between utterances
+        if awake and t + dt > awake_until:
+            rested.append(awake_until)
+            awake, awake_until = False, 0.0
         t += dt
+
         command = match_wake_word(text, wake)
-        listening = t < open_until
         if command is None:
-            if not listening:
+            if not awake:
                 continue
             command = text.strip()
+        elif not awake:
+            awake = True
         if not command:
-            open_until = t + follow_up
+            awake_until = t + follow_up
             continue
         acted.append(command)
-        open_until = t + follow_up
-    return acted
+        awake_until = t + timeout
+    return acted, rested
 
 
-check("bare wake word alone acts on nothing",
-      conversation([("hey hank", 0)]) == [])
-check("wake word then a pause still gets the command",
-      conversation([("hey hank", 0), ("what do you see", 2)]) == ["what do you see"])
-check("one-breath command works too",
-      conversation([("hey hank what do you see", 0)]) == ["what do you see"])
-check("follow-up needs no wake word",
-      conversation([("hey hank", 0), ("what do you see", 2), ("now look left", 3)])
-      == ["what do you see", "now look left"])
-check("speech after the window closes is ignored",
-      conversation([("hey hank", 0), ("what do you see", 2), ("unrelated chatter", 60)])
-      == ["what do you see"])
-check("cold chatter is never acted on",
-      conversation([("so anyway I told him", 0), ("and then we left", 1)]) == [])
+# once woken, no wake word is needed again
+acted, rested = conversation([
+    ("hey hank what do you see", 0),
+    ("what about on your left", 5),
+    ("and how bright is it", 5),
+])
+check("conversation continues without the wake word",
+      acted == ["what do you see", "what about on your left", "and how bright is it"], str(acted))
+check("no resting during an active conversation", rested == [], str(rested))
+
+# wake word alone, then the question after a pause
+acted, _ = conversation([("hey hank", 0), ("what do you see", 3)])
+check("bare wake word then a question still works", acted == ["what do you see"], str(acted))
+
+# the conversation lapses after the timeout, and he says so
+acted, rested = conversation([
+    ("hey hank what do you see", 0),
+    ("are you still there", 200),
+])
+check("he rests after the timeout", len(rested) == 1, str(rested))
+check("speech after resting needs the wake word again", acted == ["what do you see"], str(acted))
+
+# and can be woken again afterwards
+acted, rested = conversation([
+    ("hey hank what do you see", 0),
+    ("unrelated chatter", 200),
+    ("hey hank look left", 20),
+])
+check("he can be woken again after resting",
+      acted == ["what do you see", "look left"], str(acted))
+check("chatter while resting is ignored", len(acted) == 2, str(acted))
+
+# never rests mid-answer: the window is infinite while instruct() runs
+check("resting cannot interrupt an answer", float("inf") > 1e9)
+
+# cold chatter is still ignored entirely
+acted, _ = conversation([("so anyway I told him", 0), ("and then we left", 1)])
+check("chatter never wakes him", acted == [], str(acted))
+
+check("rest phrases exist and vary", len(set(REST_PHRASES)) >= 3)
+check("rest phrases name the wake word",
+      all("hank" in p.lower() for p in REST_PHRASES))
+
+# ---------- conversation memory ----------
+print("\nConversation memory")
+from jettank.cloud import AgentSession  # noqa: E402
+
+
+def session():
+    a = AgentSession.__new__(AgentSession)
+    AgentSession.__init__(a, agent=None, toolbox=None, history_turns=2)
+    return a
+
+
+sess = session()
+check("a new session has no history", sess.in_conversation is False)
+sess._remember([
+    {"role": "user", "content": [{"type": "text", "text": "what do you see"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "a lamp"}]},
+])
+check("history is kept after an exchange", sess.in_conversation is True)
+check("reset clears it", (sess.reset(), sess.in_conversation)[1] is False)
+
+# images must not accumulate - each retained frame is re-uploaded and re-billed
+sess = session()
+sess._remember([
+    {"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                     "data": "AAAA"}},
+        {"type": "text", "text": "what is this"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "a lamp"}]},
+])
+blocks = [b for m in sess._history for b in m["content"]]
+check("images are dropped from history", not any(b.get("type") == "image" for b in blocks))
+check("the text of that turn is kept",
+      any(b.get("text") == "what is this" for b in blocks))
+
+# history is bounded, and never starts on a dangling assistant turn
+sess = session()
+for i in range(10):
+    sess._remember(sess._history + [
+        {"role": "user", "content": [{"type": "text", "text": f"q{i}"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": f"a{i}"}]},
+    ])
+check("history is bounded", len(sess._history) <= 4, str(len(sess._history)))
+check("history always starts on a user turn", sess._history[0]["role"] == "user")
 
 # ---------- speech normalisation ----------
 print("\nSpeech normalisation (TTS reads punctuation aloud)")

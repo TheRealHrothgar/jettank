@@ -660,6 +660,7 @@ class Speaker:
         # Machine text is rephrased before it is spoken; for_speech() is the
         # mechanical fallback when the narrator is off or unreachable.
         self._narrator = narrator
+        self._last_spoke = 0.0
         self._device = pick_speaker(device)
         self._engine: str | None = None
         self._piper_voice = self._find_voice(voice)
@@ -730,6 +731,11 @@ class Speaker:
             log.debug("SynthesisConfig unavailable (%s)", exc)
             return None
 
+    def _lead_in_ms(self) -> int:
+        """Full lead-in only when the amplifier has had time to sleep."""
+        warm = (time.monotonic() - self._last_spoke) < self.WARM_WINDOW_S
+        return self.LEAD_IN_WARM_MS if warm else self.LEAD_IN_MS
+
     @staticmethod
     def _silence(rate: int, ms: int) -> bytes:
         return b"\x00" * (2 * int(rate * ms / 1000))
@@ -765,6 +771,18 @@ class Speaker:
     # writes to a blocking pipe self-pace: aplay consumes at exactly realtime,
     # so the write blocks whenever we get ahead. No sleeping, no rate maths.
     PREBUFFER_MS = int(os.environ.get("JETTANK_TTS_PREBUFFER_MS", "400"))
+    # The USB speakerphone powers its amplifier down when idle and takes a
+    # moment to come back, so the opening syllable is lost - clipped in the
+    # hardware, not in the audio, which is why the PCM measures correct and
+    # still sounds wrong. Silence in front gives the DAC time to settle.
+    #
+    # Two values, because the cost only applies when it is actually cold. In a
+    # back-and-forth conversation the amplifier is still up from the previous
+    # reply, and paying half a second before every turn would make Hank feel
+    # sluggish for no benefit.
+    LEAD_IN_MS = int(os.environ.get("JETTANK_TTS_LEAD_IN_MS", "600"))
+    LEAD_IN_WARM_MS = int(os.environ.get("JETTANK_TTS_LEAD_IN_WARM_MS", "120"))
+    WARM_WINDOW_S = float(os.environ.get("JETTANK_TTS_WARM_WINDOW", "8.0"))
     ALSA_BUFFER_US = int(os.environ.get("JETTANK_TTS_BUFFER_US", "1000000"))
     ALSA_PERIOD_US = int(os.environ.get("JETTANK_TTS_PERIOD_US", "100000"))
     WRITE_BLOCK_MS = 100
@@ -819,6 +837,9 @@ class Speaker:
                     if len(pending) < prebuffer:
                         continue            # keep filling; do not start starved
                     proc = start(rate, channels)
+                    lead = self._lead_in_ms()
+                    if lead > 0:
+                        proc.stdin.write(self._silence(rate, lead))
                 written += flush(proc, pending, 2 * channels *
                                  int(rate * self.WRITE_BLOCK_MS / 1000))
 
@@ -827,6 +848,9 @@ class Speaker:
                     return {"ok": False, "error": "TTS produced no audio",
                             "spoken_text": text}
                 proc = start(rate, channels)
+                lead = self._lead_in_ms()
+                if lead > 0:
+                    proc.stdin.write(self._silence(rate, lead))
             if pending:
                 proc.stdin.write(bytes(pending))
                 written += len(pending)
@@ -843,6 +867,7 @@ class Speaker:
 
         if not written:
             return {"ok": False, "error": "TTS produced no audio", "spoken_text": text}
+        self._last_spoke = time.monotonic()
         return {"ok": True, "spoken_text": text,
                 "duration_s": round(written / 2 / channels / rate, 2)}
 

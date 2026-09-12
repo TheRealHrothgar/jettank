@@ -272,7 +272,8 @@ class AgentSession:
     """
 
     def __init__(self, agent: "CloudAgent", toolbox, max_turns: int = 8,
-                 max_tokens: int = 8192, system_facts: str = "") -> None:
+                 max_tokens: int = 8192, system_facts: str = "",
+                 history_turns: int = 8) -> None:
         self._agent = agent
         self._tools = toolbox
         self._max_turns = max_turns
@@ -280,16 +281,62 @@ class AgentSession:
         # Gathered from the running machine at startup rather than hardcoded,
         # so it cannot claim a capability that is no longer installed.
         self._system_facts = system_facts
+        # Conversation carried between calls. Without this, "what about over
+        # there?" has no referent - each utterance would start from nothing.
+        self._history: list[dict] = []
+        self._history_turns = history_turns
 
     @property
     def system_prompt(self) -> str:
         if not self._system_facts:
             return AGENT_SYSTEM_PROMPT
         return f"{AGENT_SYSTEM_PROMPT}\n\n{self._system_facts}"
-        self.transcript: list[dict] = []
 
-    async def run(self, instruction: str, image_b64: str | None = None) -> dict:
-        """Give the model an instruction; let it drive until it is done."""
+    @property
+    def in_conversation(self) -> bool:
+        return bool(self._history)
+
+    def reset(self) -> None:
+        """Forget the conversation. Called when Hank goes back to sleep."""
+        self._history.clear()
+
+    def _remember(self, messages: list[dict]) -> None:
+        """Keep the exchange, minus anything expensive or stale.
+
+        Images are dropped from history: every retained frame is re-uploaded
+        and re-billed on every subsequent turn, and a photo of the room from
+        four questions ago is rarely what is being asked about now. The text
+        describing what was seen is kept, which is what a follow-up refers to.
+        """
+        trimmed: list[dict] = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                kept = [b for b in content if b.get("type") != "image"]
+                for b in kept:
+                    if b.get("type") == "tool_result" and isinstance(b.get("content"), list):
+                        b = dict(b)
+                        b["content"] = "[image returned]"
+                if not kept:
+                    kept = [{"type": "text", "text": "[image]"}]
+                trimmed.append({"role": m["role"], "content": kept})
+            else:
+                trimmed.append(m)
+        # Keep whole user/assistant exchanges, never a dangling tool_use
+        # without its tool_result - the API rejects that.
+        while len(trimmed) > self._history_turns * 2:
+            del trimmed[0]
+            while trimmed and trimmed[0].get("role") != "user":
+                del trimmed[0]
+        self._history = trimmed
+
+    async def run(self, instruction: str, image_b64: str | None = None,
+                  remember: bool = False) -> dict:
+        """Give the model an instruction; let it drive until it is done.
+
+        `remember=True` continues the existing conversation and keeps this
+        exchange for the next one.
+        """
         if not self._agent.enabled:
             return {"ok": False, "error": "cloud agent is not configured"}
 
@@ -302,7 +349,8 @@ class AgentSession:
                            "data": image_b64},
             })
         content.append({"type": "text", "text": instruction})
-        messages: list[dict] = [{"role": "user", "content": content}]
+        messages: list[dict] = ([*self._history, {"role": "user", "content": content}]
+                                if remember else [{"role": "user", "content": content}])
 
         used: list[str] = []
         for turn in range(self._max_turns):
@@ -324,6 +372,8 @@ class AgentSession:
             said = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
             if not calls:
+                if remember:
+                    self._remember(messages)
                 return {"ok": True, "reply": said, "tools_used": used, "turns": turn + 1}
 
             results = []
