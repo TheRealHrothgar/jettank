@@ -157,12 +157,25 @@ class ConsoleConfig:
 
 
 @dataclass(frozen=True)
+class LiveConfig:
+    """Applying edits without a restart.
+
+    A restart costs ~20s and drops the conversation, which is the whole
+    feedback loop when iterating on a prompt or a limit.
+    """
+
+    watch: bool = field(default_factory=lambda: _env_b("JETTANK_LIVE_RELOAD", True))
+    interval_s: float = field(default_factory=lambda: _env_f("JETTANK_LIVE_INTERVAL", 3.0))
+
+
+@dataclass(frozen=True)
 class Config:
     camera: CameraConfig = field(default_factory=CameraConfig)
     vlm: VLMConfig = field(default_factory=VLMConfig)
     cloud: CloudConfig = field(default_factory=CloudConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     console: ConsoleConfig = field(default_factory=ConsoleConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
     # Safety: the local loop must keep running even if everything else stalls.
     watchdog_s: float = field(default_factory=lambda: _env_f("JETTANK_WATCHDOG", 5.0))
 

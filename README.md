@@ -43,6 +43,31 @@ field names and documentation do not trip it.
 `rsync --delete`, so a change made only in `~/git/jettank` is silently
 reverted on the next sync.
 
+## Changing things without a restart
+
+A restart costs ~20s - Piper's voice, whisper, the mic recalibrating, the VLM
+reloading - and drops any conversation in progress. So edits apply live:
+
+```bash
+vim prompts/agent.md      # or a setting in ~/.jettank.env
+./scripts/deploy.sh       # deploys AND reloads the running robot
+```
+
+Or say **"Hank reload"**, or press **reload code** on the console. A file
+watcher also picks up changes within a few seconds on its own.
+
+| reloads live | needs `systemctl restart hank` |
+|---|---|
+| prompts (`prompts/*.md`) | audio devices |
+| runtime settings | the serial link to the board |
+| the motion/servo map | the camera |
+| behaviours, skills | the loaded Piper voice |
+
+The split is ownership of hardware, not code purity. Re-importing a module
+whose instance holds an open file descriptor does not give you new behaviour;
+it gives you two objects that both think they own the device. `reload()`
+reports what it could not apply rather than pretending.
+
 ## Secrets
 
 Nothing secret is in either tree:

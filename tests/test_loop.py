@@ -622,6 +622,46 @@ check("no tool clears an estop",
       not ({"clear_estop", "reset_estop"} & {t["name"] for t in TOOL_SCHEMAS}))
 guard5.close()
 
+# ---------- live reload ----------
+print("\nLive reload (apply edits without a restart)")
+from jettank.control import RELOAD_PHRASES  # noqa: E402
+from jettank.live import RELOADABLE_MODULES, Reloader  # noqa: E402
+
+check("reload is a control word", classify("Hank reload") == "reload")
+check("reload hank also works", classify("reload hank") == "reload")
+check("ordinary speech does not reload",
+      classify("reload the page") is None and classify("can you reload") is None)
+check("reload phrases are name-prefixed", all("hank" in p for p in RELOAD_PHRASES))
+
+# The allow-list is the whole safety argument: nothing that owns a device.
+danger = {"jettank.audio", "jettank.tools", "jettank.drive", "jettank.board",
+          "jettank.loop", "jettank.camera", "jettank.console"}
+check("no device-owning module is reloadable",
+      not (set(RELOADABLE_MODULES) & danger), str(RELOADABLE_MODULES))
+check("the reloadable list is not empty", len(RELOADABLE_MODULES) >= 3)
+
+# A bad prompt file must not take the robot down.
+class FakeAgent:
+    _system_facts = ""
+
+
+class ReloadLoop:
+    def __init__(self):
+        self.agent = FakeAgent()
+        self.system_facts = "facts"
+        self.vlm_interval = 1.5
+        self.cloud_min_interval = 6.0
+        self.robot = None
+        self.skills = type("S", (), {"_load": lambda s: None, "names": lambda s: []})()
+        self.cfg = None
+
+
+rl = Reloader(ReloadLoop())
+check("changed_files does not fire on the first look",
+      isinstance(rl.changed_files(), list))
+check("a second look with no edits reports nothing", rl.changed_files() == [])
+check("reloading with no motion map is harmless", rl.reload_motion_map() == [])
+
 # ---------- conversation: wake, continue, rest ----------
 print("\nConversation (wake, continue, rest)")
 

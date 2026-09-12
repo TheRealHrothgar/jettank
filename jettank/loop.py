@@ -32,6 +32,7 @@ from .skills import SkillStore
 from .sysinfo import collect as collect_sysinfo, describe as describe_sysinfo
 from .cloud import AgentSession, CloudAgent, register_tools
 from .faces import FaceEngine
+from .live import Reloader
 from .narrator import Narrator
 from .robot import build as build_robot
 from .safety import MotionGuard
@@ -140,7 +141,9 @@ class Loop:
         self._awake = False
         self._work: asyncio.Task | None = None
         self._killed = False
+        self.reloader = Reloader(self)
         self._arm_requested = 0.0
+        self.reloader = Reloader(self)
 
         self.transcript: deque[dict] = deque(maxlen=32)
         self.observations: deque[str] = deque(maxlen=32)
@@ -355,6 +358,9 @@ class Loop:
                 if control == "arm":
                     self._set_motion(True, "voice")
                     continue
+                if control == "reload":
+                    self.reload_now("voice")
+                    continue
 
                 command = match_wake_word(text, wake)
                 if command is None:
@@ -480,6 +486,46 @@ class Loop:
                           "'Hank arm motion' out loud. Tell them that, and why "
                           "you want to move."}
 
+    def reload_now(self, source: str = "manual") -> dict:
+        """Re-apply prompts, settings and the hardware map in place."""
+        try:
+            result = self.reloader.reload()
+        except Exception as exc:  # noqa: BLE001 - a bad edit must not kill Hank
+            log.exception("reload failed")
+            if self.console:
+                self.console.event("err", f"reload failed: {exc}")
+            self.say("I could not reload. The old settings are still running.")
+            return {"ok": False, "error": str(exc)}
+        bits = [k for k in ("modules", "prompts", "settings", "hardware")
+                if result.get(k)]
+        log.info("[live] reload from %s: %s", source, bits or "no changes")
+        if self.console:
+            self.console.event("agent", f"reloaded ({', '.join(bits) or 'no changes'})")
+        if source == "voice":
+            self.say("Reloaded." if bits else "Nothing had changed.")
+        return {"ok": True, **result}
+
+    async def watch_forever(self) -> None:
+        """Reload automatically when a watched file changes on disk.
+
+        Polling rather than inotify: the interval is seconds, the file list is
+        a dozen entries, and it works the same over a network mount.
+        """
+        if not self.cfg.live.watch:
+            return
+        self.reloader.changed_files()          # prime, do not fire on startup
+        log.info("watching for live edits every %.0fs", self.cfg.live.interval_s)
+        while not self._stop.is_set():
+            await asyncio.sleep(self.cfg.live.interval_s)
+            try:
+                changed = await asyncio.to_thread(self.reloader.changed_files)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("watch failed: %s", exc)
+                continue
+            if changed:
+                log.info("[live] changed on disk: %s", ", ".join(changed))
+                self.reload_now("watch")
+
     def _wake(self) -> None:
         self._awake = True
         log.info("[voice] awake - conversation open, no wake word needed")
@@ -547,6 +593,7 @@ class Loop:
         tasks = [
             asyncio.create_task(self.perceive_forever()),
             asyncio.create_task(self.status_forever()),
+            asyncio.create_task(self.watch_forever()),
         ]
         if self.voice is not None:
             tasks.append(asyncio.create_task(self.listen_forever()))

@@ -48,6 +48,7 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Hank the Tank</title>
     <button type=button onclick="act('estop')" class=stop>E-STOP (motion)</button>
     <button type=button onclick="act('arm')">arm motion</button>
     <button type=button onclick="act('disarm')">disarm</button>
+    <button type=button onclick="act('reload')">reload code</button>
     <div id=stat></div>
   </div>
 </div>
@@ -129,6 +130,12 @@ class Console:
 
     def control(self, action: str) -> str:
         g = self._loop.guard
+        if action == "reload":
+            r = self._loop.reload_now("console")
+            if not r.get("ok"):
+                return f"reload failed: {r.get('error')}"
+            bits = [k for k in ("modules", "prompts", "settings", "hardware") if r.get(k)]
+            return "reloaded: " + (", ".join(bits) if bits else "no changes")
         if action == "interrupt":
             # Same path as the spoken control word, so there is one
             # implementation of "abandon what is running".

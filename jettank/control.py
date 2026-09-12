@@ -73,6 +73,14 @@ DISARM_PHRASES = _phrases(
     "hank motion off,hank do not move,hank dont move,hank stay still",
 )
 
+# Re-apply edited prompts, settings and the hardware map without restarting.
+# A control word because it is most useful exactly when you are iterating and
+# do not want to stop what he is doing.
+RELOAD_PHRASES = _phrases(
+    "JETTANK_RELOAD_WORDS",
+    "hank reload,reload hank,hank refresh,hank reload yourself",
+)
+
 # Speech-to-text adds trailing punctuation and the occasional filler.
 _FILLER = re.compile(r"^(?:uh|um|er|ah|ok|okay|hey|please|now|just)\s+", re.I)
 _PUNCT = re.compile(r"[^\w\s]")
@@ -108,4 +116,6 @@ def classify(text: str) -> str | None:
         return "disarm"
     if t in ARM_PHRASES:
         return "arm"
+    if t in RELOAD_PHRASES:
+        return "reload"
     return None
