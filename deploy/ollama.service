@@ -11,9 +11,15 @@ Group=jetson
 # to set it up, and keeping it there means an upgrade does not require sudo.
 Environment="HOME=/home/jetson"
 Environment="OLLAMA_HOST=127.0.0.1:11434"
-# Keep models resident. Hank's narrator is called once per utterance; paying a
-# cold load each time is what made the first composition time out.
-Environment="OLLAMA_KEEP_ALIVE=30m"
+# Keeping models resident avoids a cold load per utterance, but two models
+# resident at once (the 3B vision model plus the 1.5B narrator) reached 5.3GB
+# and the kernel OOM-killed llama-server on this 7.3GB shared-memory board.
+# One at a time, and let them go after a few minutes of quiet.
+Environment="OLLAMA_KEEP_ALIVE=5m"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+# The vision model does not need a large window and the window is what costs
+# memory; frames are described one at a time, not accumulated.
+Environment="OLLAMA_CONTEXT_LENGTH=2048"
 ExecStart=/home/jetson/.local/ollama/bin/ollama serve
 Restart=always
 RestartSec=5

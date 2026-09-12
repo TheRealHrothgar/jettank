@@ -1,0 +1,15 @@
+[Unit]
+Description=Put the Orin Nano USB-C port into host mode
+# The port defaults to "device" (USB gadget, used for flashing), so anything
+# plugged into it never enumerates. As a host it is a separate root controller
+# - NOT behind the Realtek hub the four USB-A ports share - which gives a
+# power-hungry peripheral like the LIDAR its own budget.
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/bin/sh -c 'echo host > /sys/class/usb_role/usb2-0-role-switch/role'
+
+[Install]
+WantedBy=multi-user.target
