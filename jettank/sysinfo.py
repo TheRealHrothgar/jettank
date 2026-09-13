@@ -85,6 +85,7 @@ def collect(loop=None) -> dict:
         facts["camera"] = loop.cfg.camera.device
         facts["camera_resolution"] = f"{loop.cam_width}x{loop.cam_height}"
         facts["arm"] = hasattr(loop.robot, "arm_positions")
+        facts["light"] = hasattr(loop.robot, "headlights")
         board = getattr(loop, "board", None)
         facts["board"] = board.status() if board is not None else {}
     return facts
@@ -174,6 +175,12 @@ def describe(facts: dict) -> str:
             "- You have NO cloud connection right now. You can still see with your "
             "local vision model, hear, speak and read your own sensors. Say so "
             "plainly if you cannot do something for that reason.")
+    if facts.get("light"):
+        lines.append(
+            "- You have a headlight you can switch on and off, and set how bright. "
+            "Use it when it is too dark to see. It turns itself off when you rest, "
+            "so you never leave it on by accident.")
+
     if facts.get("arm"):
         lines.append(
             "- You have an arm with ONE joint, and your gripper is MECHANICALLY "

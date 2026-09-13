@@ -392,6 +392,22 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "set_light",
+        "description": (
+            "Turn your headlight on or off, or set how bright it is, from 0 (off) to "
+            "100 (brightest). Use it when it is too dark for you to see properly, or "
+            "if someone asks. It switches itself off when you go to rest, so you do "
+            "not need to remember."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "brightness": {"type": "integer", "description": "0 is off, 100 is brightest"},
+            },
+            "required": ["brightness"],
+        },
+    },
+    {
         "name": "move_arm",
         "description": (
             "Move your arm to a named position: stow (folded back, jaws closed), down, "
@@ -588,6 +604,18 @@ class ToolBox:
     def _t_drive(self, linear: float, angular: float, reason: str = "") -> dict:
         accepted, note = self._guard.drive(float(linear), float(angular), reason)
         return {"ok": accepted, "detail": note}
+
+    def _t_set_light(self, brightness: int) -> dict:
+        drv = self._loop.robot
+        if not hasattr(drv, "headlights"):
+            return {"ok": False, "error": "this robot has no controllable light"}
+        try:
+            level = max(0, min(100, int(brightness)))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "brightness must be a number from 0 to 100"}
+        drv.headlights(level)
+        return {"ok": True, "brightness": level,
+                "detail": "off" if level == 0 else f"on at {level} percent"}
 
     def _t_move_arm(self, position: str) -> dict:
         drv = self._loop.robot

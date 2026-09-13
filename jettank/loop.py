@@ -691,6 +691,13 @@ class Loop:
             # running - a behaviour, an agent turn, a long capture - continues
             # and still reports when it finishes. Only STOP cancels work.
             self.agent.reset()          # forget the conversation, not the task
+            # Lights out when he rests. It is a real current draw, and a robot
+            # sitting alone in the dark with its headlight on all night is
+            # exactly the kind of thing nobody notices until the battery is
+            # flat. He can turn it straight back on when woken.
+            with contextlib.suppress(Exception):
+                if hasattr(self.robot, "headlights"):
+                    self.robot.headlights(0)
             log.info("[voice] resting - wake word required again")
             if self.console:
                 self.console.event("agent", "resting; say the wake word to start again")
@@ -769,6 +776,9 @@ class Loop:
                     await t
             if self.console is not None:
                 self.console.stop()
+            with contextlib.suppress(Exception):
+                if hasattr(self.robot, "headlights"):
+                    self.robot.headlights(0)
             self.board.stop()
             self.guard.close()
             self.robot.stop()

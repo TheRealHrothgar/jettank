@@ -215,14 +215,26 @@ def arm_frame(servo_id: int, pulse: int, run_time_ms: int = 500) -> bytes:
                   + struct.pack("<h", run))
 
 
-def arm_query_frame(servo_id: int) -> bytes:
-    """Ask a bus servo for its position.
+def arm_set_id_frame(servo_id: int) -> bytes:
+    """ASSIGN an id to a bus servo. THIS IS A WRITE, NOT A QUERY.
 
-    The reply arrives asynchronously on the telemetry stream as a 0x20 frame
-    carrying [id, int16 position]. Useful for finding which servos physically
-    exist: an id that answers is present, one that does not is not wired.
+    It was previously named arm_query_frame and used to probe which servos
+    existed, on the assumption that 0x21 asked a servo for its position. It
+    does not - Yahboom's own comment on this function reads:
+
+        "Before running this function, please confirm that only one bus
+        actuator is connected. Otherwise, all connected bus actuators will be
+        set to the same ID, resulting in confusion of control."
+
+    So every "probe" call reassigned the id of every servo on the bus. Whether
+    that caused the id collision we later found is not established - the arm
+    answers to 10 rather than 13, the last value that probe sent, and the servo
+    board may have been unpowered at the time - but it could have, and a
+    function that silently rewrites hardware addresses must not be named query.
+
+    ONLY call this with a single servo physically attached.
     """
-    return encode(FUNC_UART_SERVO_ID, bytes((int(servo_id) & 0xFF,)))
+    return encode(FUNC_UART_SERVO_ID, bytes((max(1, min(int(servo_id), 250)),)))
 
 
 def arm_all_frame(angle7: float, angle8: float, angle9: float,
