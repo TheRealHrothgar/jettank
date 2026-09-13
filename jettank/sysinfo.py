@@ -84,6 +84,7 @@ def collect(loop=None) -> dict:
         facts["speech_out"] = getattr(getattr(loop, "speaker", None), "_engine", None) or "none"
         facts["camera"] = loop.cfg.camera.device
         facts["camera_resolution"] = f"{loop.cam_width}x{loop.cam_height}"
+        facts["arm"] = hasattr(loop.robot, "arm_positions")
         board = getattr(loop, "board", None)
         facts["board"] = board.status() if board is not None else {}
     return facts
@@ -173,6 +174,13 @@ def describe(facts: dict) -> str:
             "- You have NO cloud connection right now. You can still see with your "
             "local vision model, hear, speak and read your own sensors. Say so "
             "plainly if you cannot do something for that reason.")
+    if facts.get("arm"):
+        lines.append(
+            "- You have an arm with ONE working joint, so it swings as a whole "
+            "rather than articulating. Positions: stow, down, level, up, raised. "
+            "Your gripper does NOT work - the jaws do not respond to any command - "
+            "so never offer to pick anything up or grab anything.")
+
     lines.append(
         "- Whether your motors are armed is a person's decision, never yours. "
         "'Hank arm motion' spoken aloud arms them; 'Hank disarm' turns them off, "

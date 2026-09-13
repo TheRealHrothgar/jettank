@@ -334,7 +334,7 @@ class RosmasterDriver:
         self.pan = 0.0
         self.tilt = 0.0
         self.light = 0
-        self.arm_angles: dict[int, float] = {}
+        self.arm_pulse = 2000
         self._pan_sign = 1 if self._v.get("pan_sign", 1) >= 0 else -1
         self._tilt_sign = 1 if self._v.get("tilt_sign", 1) >= 0 else -1
 
@@ -396,50 +396,61 @@ class RosmasterDriver:
         self.pan, self.tilt = p, t
 
     # ---- arm ----
-    def arm(self, joint: str | int, angle: float, run_time_ms: int = 600) -> None:
-        """Move one arm joint. `joint` is a servo id (7, 8, 9) or a mapped name.
+    # Only servo 10 responds on this robot (see the scan results above), so the
+    # interface is built around the one joint that exists rather than pretending
+    # to be a three-axis arm. Positions are named because raw pulse values are
+    # meaningless to anyone using this, including the model.
+    ARM_POSES = {
+        "stow": 2600,       # folded back, out of the camera's view
+        "down": 2300,
+        "level": 2000,      # centre
+        "up": 1700,
+        "raised": 1400,     # fully up, gripper toward the camera
+    }
 
-        Gated like the motors: an unverified arm is not moved, because driving
-        a bus servo past its end stop stalls it against its own gearbox.
+    def arm(self, position: str | int | float, run_time_ms: int = 800) -> None:
+        """Move the arm joint. Accepts a pose name or a raw pulse.
+
+        Pulse travel is clamped to the range established by test - beyond it
+        the servo reaches its end stop, which showed up as the chassis rocking
+        hard enough to trip the IMU guard.
         """
         if not self.confirmed("arm"):
-            log.warning("[arm] arm not verified - not transmitting "
-                        "(run tools/verify_arm.py)")
+            log.warning("[arm] arm not verified on this robot - not transmitting")
             return
-        sid = self._joint_id(joint)
-        if sid is None:
-            log.error("[arm] unknown joint %r; known: %s", joint, self.joint_names())
-            return
-        lo, hi = ARM_RANGE[sid]
-        clamped = max(lo, min(hi, float(angle)))
-        if clamped != angle:
-            log.info("[arm] joint %s angle %.0f clamped to %.0f (range %d-%d)",
-                     joint, angle, clamped, lo, hi)
-        offset = float(self._v.get(f"arm_offset_{sid}", 0.0))
-        self._link.send(arm_frame(sid, arm_angle_to_pulse(sid, clamped, offset),
-                                  run_time_ms))
-        self.arm_angles[sid] = clamped
+        if isinstance(position, str):
+            pulse = self.ARM_POSES.get(position.lower())
+            if pulse is None:
+                log.error("[arm] unknown position %r; known: %s",
+                          position, ", ".join(self.ARM_POSES))
+                return
+        else:
+            pulse = int(position)
+        lo, hi = ARM_JOINT_PULSE
+        clamped = max(lo, min(hi, pulse))
+        if clamped != pulse:
+            log.info("[arm] pulse %d clamped to %d (safe travel %d-%d)",
+                     pulse, clamped, lo, hi)
+        self._link.send(arm_frame(ARM_SERVO_JOINT, clamped, run_time_ms))
+        self.arm_pulse = clamped
 
-    def _joint_id(self, joint) -> int | None:
-        if isinstance(joint, int):
-            return joint if joint in ARM_JOINTS else None
-        names = self._v.get("arm_names", {})
-        for sid, name in names.items():
-            if str(name).lower() == str(joint).lower():
-                return int(sid)
-        return None
+    def arm_position(self) -> str:
+        """Nearest named pose to where the arm currently is."""
+        return min(self.ARM_POSES,
+                   key=lambda k: abs(self.ARM_POSES[k] - self.arm_pulse))
 
-    def joint_names(self) -> list[str]:
-        return sorted(str(n) for n in self._v.get("arm_names", {}).values()) or \
-            [str(j) for j in ARM_JOINTS]
+    def arm_positions(self) -> list[str]:
+        return list(self.ARM_POSES)
 
     def gripper(self, closed: bool) -> None:
-        sid = self._joint_id("gripper")
-        if sid is None:
-            log.warning("[gripper] no joint mapped as the gripper yet")
-            return
-        lo, hi = ARM_RANGE[sid]
-        self.arm(sid, lo if closed else hi)
+        """Not available: no servo on this robot actuates the jaws.
+
+        Verified with the jaws in direct view of the camera - see the scan
+        results at the top of this module. Says so rather than silently doing
+        nothing, so a caller gets an explanation instead of a no-op.
+        """
+        log.warning("[gripper] this robot has no controllable gripper - the "
+                    "jaws do not respond on any servo id")
 
     def arm_torque(self, on: bool) -> None:
         """Hold position, or go limp so the arm can be posed by hand."""

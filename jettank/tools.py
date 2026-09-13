@@ -392,6 +392,26 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "move_arm",
+        "description": (
+            "Move your arm to a named position: stow (folded back, out of your camera's "
+            "view), down, level, up, or raised (fully up, gripper toward your camera). "
+            "Your arm has ONE working joint, so it swings as a whole rather than "
+            "articulating. You have no working gripper - the jaws do not respond to any "
+            "command - so do not offer to pick things up."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "position": {
+                    "type": "string",
+                    "description": "stow, down, level, up, or raised",
+                },
+            },
+            "required": ["position"],
+        },
+    },
+    {
         "name": "set_motion",
         "description": (
             "Turn your own motors OFF, or ASK to have them turned on. "
@@ -564,6 +584,18 @@ class ToolBox:
     def _t_drive(self, linear: float, angular: float, reason: str = "") -> dict:
         accepted, note = self._guard.drive(float(linear), float(angular), reason)
         return {"ok": accepted, "detail": note}
+
+    def _t_move_arm(self, position: str) -> dict:
+        drv = self._loop.robot
+        if not hasattr(drv, "arm_positions"):
+            return {"ok": False, "error": "this robot has no controllable arm"}
+        known = drv.arm_positions()
+        if str(position).lower() not in known:
+            return {"ok": False, "error": f"unknown position {position!r}",
+                    "known_positions": known}
+        drv.arm(str(position).lower())
+        return {"ok": True, "position": drv.arm_position(),
+                "note": "the arm has one joint and no working gripper"}
 
     def _t_set_motion(self, enabled: bool, reason: str = "") -> dict:
         # Disabling is unconditional; enabling is a request a human must grant.
