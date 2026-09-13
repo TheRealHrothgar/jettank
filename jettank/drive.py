@@ -400,13 +400,19 @@ class RosmasterDriver:
     # interface is built around the one joint that exists rather than pretending
     # to be a three-axis arm. Positions are named because raw pulse values are
     # meaningless to anyone using this, including the model.
+    # The jaws are MECHANICALLY LINKED to this joint - there is no separate
+    # gripper servo, and the linkage closes the claw as the arm folds down and
+    # opens it as the arm folds up. So arm angle and grip are one degree of
+    # freedom, not two, and the pose names reflect both meanings.
     ARM_POSES = {
-        "stow": 2600,       # folded back, out of the camera's view
-        "down": 2300,
-        "level": 2000,      # centre
-        "up": 1700,
-        "raised": 1400,     # fully up, gripper toward the camera
+        "stow": 2600,       # folded back, out of camera view - jaws CLOSED
+        "down": 2300,       # jaws closing
+        "level": 2000,      # centre, jaws part open
+        "up": 1700,         # jaws opening
+        "raised": 1400,     # fully up, toward the camera - jaws OPEN
     }
+    GRIP_CLOSED_PULSE = 2600
+    GRIP_OPEN_PULSE = 1400
 
     def arm(self, position: str | int | float, run_time_ms: int = 800) -> None:
         """Move the arm joint. Accepts a pose name or a raw pulse.
@@ -443,14 +449,30 @@ class RosmasterDriver:
         return list(self.ARM_POSES)
 
     def gripper(self, closed: bool) -> None:
-        """Not available: no servo on this robot actuates the jaws.
+        """Open or close the jaws by folding the arm.
 
-        Verified with the jaws in direct view of the camera - see the scan
-        results at the top of this module. Says so rather than silently doing
-        nothing, so a caller gets an explanation instead of a no-op.
+        There is no independent gripper servo - the claw is linked to the arm
+        joint, closing as the arm folds down and opening as it folds up. So
+        this necessarily moves the arm too, which is a real constraint rather
+        than an implementation detail: you cannot hold something and then
+        raise it, because raising it is what opens the jaws.
         """
-        log.warning("[gripper] this robot has no controllable gripper - the "
-                    "jaws do not respond on any servo id")
+        if not self.confirmed("arm"):
+            log.warning("[gripper] arm not verified - not transmitting")
+            return
+        self.arm(self.GRIP_CLOSED_PULSE if closed else self.GRIP_OPEN_PULSE, 1000)
+        log.info("[gripper] %s (via the arm linkage)",
+                 "closed" if closed else "opened")
+
+    def grip_state(self) -> str:
+        """Roughly how open the jaws are, inferred from the arm angle."""
+        span = self.GRIP_CLOSED_PULSE - self.GRIP_OPEN_PULSE
+        frac = (self.GRIP_CLOSED_PULSE - self.arm_pulse) / span
+        if frac > 0.75:
+            return "open"
+        if frac < 0.25:
+            return "closed"
+        return "part open"
 
     def arm_torque(self, on: bool) -> None:
         """Hold position, or go limp so the arm can be posed by hand."""

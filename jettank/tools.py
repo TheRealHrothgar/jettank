@@ -394,11 +394,12 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "move_arm",
         "description": (
-            "Move your arm to a named position: stow (folded back, out of your camera's "
-            "view), down, level, up, or raised (fully up, gripper toward your camera). "
-            "Your arm has ONE working joint, so it swings as a whole rather than "
-            "articulating. You have no working gripper - the jaws do not respond to any "
-            "command - so do not offer to pick things up."
+            "Move your arm to a named position: stow (folded back, jaws closed), down, "
+            "level, up, or raised (fully up toward your camera, jaws open). "
+            "Your arm has ONE joint and your JAWS ARE LINKED TO IT - they close as the "
+            "arm folds down and open as it folds up. Grip and arm angle are the same "
+            "control, so you cannot grab something and then lift it: lifting is what "
+            "opens the jaws. Say so if asked to pick something up."
         ),
         "input_schema": {
             "type": "object",
@@ -595,7 +596,8 @@ class ToolBox:
                     "known_positions": known}
         drv.arm(str(position).lower())
         return {"ok": True, "position": drv.arm_position(),
-                "note": "the arm has one joint and no working gripper"}
+                "jaws": drv.grip_state() if hasattr(drv, "grip_state") else "unknown",
+                "note": "jaws are linked to the arm angle, not independent"}
 
     def _t_set_motion(self, enabled: bool, reason: str = "") -> dict:
         # Disabling is unconditional; enabling is a request a human must grant.

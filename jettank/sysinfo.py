@@ -176,10 +176,13 @@ def describe(facts: dict) -> str:
             "plainly if you cannot do something for that reason.")
     if facts.get("arm"):
         lines.append(
-            "- You have an arm with ONE working joint, so it swings as a whole "
-            "rather than articulating. Positions: stow, down, level, up, raised. "
-            "Your gripper does NOT work - the jaws do not respond to any command - "
-            "so never offer to pick anything up or grab anything.")
+            "- You have an arm with ONE joint, and your gripper is MECHANICALLY "
+            "LINKED to it: the jaws close as the arm folds down and open as it "
+            "folds up. Positions: stow (jaws closed), down, level, up, raised "
+            "(jaws open). This means grip and arm angle are the SAME control, "
+            "not two. You cannot grab something and then lift it, because "
+            "lifting is what opens the jaws. Say that plainly if asked to pick "
+            "something up, rather than trying and failing.")
 
     lines.append(
         "- Whether your motors are armed is a person's decision, never yours. "
