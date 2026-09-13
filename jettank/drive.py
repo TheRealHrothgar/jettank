@@ -426,10 +426,19 @@ class RosmasterDriver:
     # like a linkage from outside. Broadcast id 254 and id 10 produce near
     # identical motion (4393 vs 4203 peak), consistent with either.
     #
-    # Distinguishing them needs the arm disconnected and each servo attached
-    # alone. If (b) holds, re-IDing them to 7/8/9 one at a time gives a real
-    # three-axis arm AND an independent gripper. Worth doing before accepting
-    # this robot has one degree of freedom.
+    # (b) is CONFIRMED: several joints bend at once on a single id 10 command.
+    #
+    # And it CANNOT be repaired in software. set_uart_servo_id takes only the
+    # new id, with no target - setting an id is inherently a broadcast to the
+    # whole bus. The arm has one cable out, and the board's Servo1/Servo2 are
+    # the same electrical net, so every servo always receives the same new id
+    # together. There is no sequence of commands that separates them.
+    #
+    # Repair requires opening the arm to reach the connectors between segments
+    # and isolating one servo at a time. Until someone does that, this is a
+    # one-degree-of-freedom arm with a gripper that follows it - which is
+    # exactly how it is presented to the model and to the user, rather than
+    # pretending otherwise.
     #
     # Either way the behaviour below is correct as observed, so it stands.
     ARM_POSES = {
