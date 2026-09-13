@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import subprocess
 import threading
 import time
 from collections import deque
@@ -41,6 +42,17 @@ from .tools import TOOL_SCHEMAS, Speaker, ToolBox
 from .vlm import LocalVLM
 
 log = logging.getLogger("jettank")
+
+
+def _usb_capture_present() -> bool:
+    """Is there a USB capture device at all? Cheap check before reopening."""
+    try:
+        out = subprocess.run(["arecord", "-l"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    return any(line.startswith("card ") and "APE" not in line and "HDA" not in line
+               for line in out.splitlines())
 
 # Varied so it does not become wallpaper - the same sentence every time stops
 # being heard after a day.
@@ -144,9 +156,13 @@ class Loop:
         self._work: asyncio.Task | None = None
         self._killed = False
         self.reloader = Reloader(self)
+        self._bad_frames = 0
+        self._last_cam_restart = 0.0
         self.battery = BatteryMonitor(self)
         self._arm_requested = 0.0
         self.reloader = Reloader(self)
+        self._bad_frames = 0
+        self._last_cam_restart = 0.0
         self.battery = BatteryMonitor(self)
 
         self.transcript: deque[dict] = deque(maxlen=32)
@@ -529,23 +545,45 @@ class Loop:
         while not self._stop.is_set():
             await asyncio.sleep(5.0)
 
-            # Camera: present on disk but handing back nothing usable.
+            # Camera. Restarting this is NOT free: tearing down a streaming
+            # USB pipeline issues a stop-endpoint command, and doing that
+            # mid-transfer wedged the xHCI controller hard enough to kill every
+            # USB device on the robot - camera, microphone and LIDAR at once.
+            # Observed twice, about a minute after startup each time.
+            #
+            # So a restart now needs sustained failure, not one bad frame, and
+            # there is a cooldown between attempts. A momentarily short frame
+            # is normal; a camera that has genuinely gone needs the device node
+            # to have vanished too, and that case is handled by simply waiting
+            # for it to come back rather than by forcing anything.
             if not self.static_image_b64:
                 _, img = self.camera.latest_jpeg_b64()
-                healthy = bool(img) and len(img) > 1024
-                if not healthy and os.path.exists(self.cfg.camera.device):
-                    log.info("[peripherals] camera looks dead but %s exists - reopening",
-                             self.cfg.camera.device)
-                    try:
-                        self._restart_camera()
-                    except Exception as exc:  # noqa: BLE001
-                        log.debug("camera reopen failed: %s", exc)
+                if img and len(img) > 1024:
+                    self._bad_frames = 0
+                else:
+                    self._bad_frames += 1
+                    device_there = os.path.exists(self.cfg.camera.device)
+                    cooled = time.monotonic() - self._last_cam_restart > 60.0
+                    if self._bad_frames >= 6 and device_there and cooled:
+                        log.info("[peripherals] camera has produced nothing for "
+                                 "%d checks - reopening", self._bad_frames)
+                        self._last_cam_restart = time.monotonic()
+                        self._bad_frames = 0
+                        try:
+                            self._restart_camera()
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("camera reopen failed: %s", exc)
 
             # Microphone: arecord exits when its device disappears.
             v = self.voice
             if v is not None and v.available:
                 proc = getattr(v, "_proc", None)
-                if proc is not None and proc.poll() is not None:
+                # Only retry when a capture device actually exists. Without
+                # this the supervisor reopened a missing microphone every five
+                # seconds forever, logging each attempt - noise that buries the
+                # one line explaining the real problem.
+                if (proc is not None and proc.poll() is not None
+                        and _usb_capture_present()):
                     # DISARM FIRST. "Hank halt" is the primary way to stop him,
                     # and it runs on this microphone. Losing it silently left
                     # him armed and deaf, which is exactly the situation the

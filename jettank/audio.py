@@ -30,12 +30,22 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 RATE = 16000          # what every whisper build expects
-# The speakerphone runs at exactly one rate, 48000 Hz, in both directions. Ask
-# arecord for 16000 and ALSA's plug layer resamples in realtime - and with
-# playback also running it does that alongside a second live conversion, on a
-# full-speed USB device. Capture at the device's own rate and convert offline;
-# whisper still gets its 16 kHz, ALSA is left with nothing to do.
-DEVICE_RATE = int(os.environ.get("JETTANK_AUDIO_RATE", "48000"))
+# CAPTURE RATE: 16000, and this is a deliberate walk-back.
+#
+# The speakerphone reports one native rate, 48000, so capturing at 48000 looked
+# strictly better - no realtime resampling. It was not. At 48000 this
+# full-speed device needs three times the isochronous bandwidth, every frame of
+# it scheduled as a split transaction behind a high-speed hub, alongside the
+# camera's video stream. That killed the xHCI controller outright, roughly 40
+# seconds after startup, every time - taking the camera, microphone and LIDAR
+# down together. Isolated by test: camera alone survived, camera plus 48k mic
+# died at 40s, camera plus 16k mic ran indefinitely.
+#
+# So ALSA resamples capture and we accept it. The original garbling came from
+# TWO simultaneous live conversions, capture and playback; playback still runs
+# at the device's native 48000 with the conversion done offline, so only one
+# remains. One is fine. Three times the bandwidth is not.
+DEVICE_RATE = int(os.environ.get("JETTANK_CAPTURE_RATE", "16000"))
 CHANNELS = 1
 SAMPLE_BYTES = 2      # s16le
 CHUNK_MS = 30

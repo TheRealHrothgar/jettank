@@ -255,12 +255,29 @@ class StreamingCamera:
         return seq, base64.b64encode(data).decode("ascii")
 
     def stop(self) -> None:
+        """Shut the pipeline down gently.
+
+        SIGTERM lets GStreamer close the v4l2 device and release its USB
+        endpoints in order. Killing it instead leaves transfers in flight, and
+        the resulting stop-endpoint command is what wedged the xHCI controller
+        and took every USB device down with it. Worth waiting a few seconds
+        for; only escalate if it genuinely will not exit.
+        """
         self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
         if self._proc is not None:
             with contextlib.suppress(Exception):
                 self._proc.terminate()
-                self._proc.wait(timeout=2)
+                try:
+                    self._proc.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    log.warning("camera pipeline would not exit - killing it")
+                    self._proc.kill()
+                    self._proc.wait(timeout=2)
             self._proc = None
+            # Give the device a moment to settle before anyone reopens it.
+            time.sleep(0.4)
 
 
 def build_camera(device: str, width: int, height: int, fps: int):

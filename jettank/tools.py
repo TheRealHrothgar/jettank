@@ -875,7 +875,10 @@ class Speaker:
     # and not aplay - two realtime resamplers fighting over one clock.
     #
     # So we resample once, offline, and hand the device its native rate.
-    DEVICE_RATE = int(os.environ.get("JETTANK_AUDIO_RATE", "48000"))
+    # Playback keeps the device's native rate - we resample offline, so ALSA
+    # does nothing here. Only CAPTURE was walked back to 16000, for bandwidth
+    # reasons; see the note in audio.py.
+    DEVICE_RATE = int(os.environ.get("JETTANK_PLAYBACK_RATE", "48000"))
     LEAD_IN_MS = int(os.environ.get("JETTANK_TTS_LEAD_IN_MS", "600"))
     LEAD_IN_WARM_MS = int(os.environ.get("JETTANK_TTS_LEAD_IN_WARM_MS", "120"))
     WARM_WINDOW_S = float(os.environ.get("JETTANK_TTS_WARM_WINDOW", "8.0"))
