@@ -136,28 +136,31 @@ def servo_frame(servo_id: int, angle: int) -> bytes:
 
 
 # --- the arm -------------------------------------------------------------
-# STATUS: implemented and byte-exact against Yahboom's library, but NOT yet
-# observed to move anything on this robot. Everything below has been tried with
-# the servo board powered:
+# STATUS on THIS robot, established by exhaustive scan rather than by eye.
 #
-#   PWM servo ids 1-8 (0x03)      only 1 and 2 respond - the camera pan/tilt
-#   bus servo ids 7,8,9 (0x20)    no movement
-#   all three at once (0x23)      no movement
-#   torque enable (0x22)          no observable effect
-#   position query (0x21)         no reply - but this firmware answers NO
-#                                 query, not even FUNC_VERSION, so that tells
-#                                 us nothing either way
+# Scanned bus servo ids 1-40 and PWM ids 1-8, using the chassis IMU as an
+# objective detector - a servo that moves the arm perturbs the accelerometer,
+# so this did not depend on someone watching:
 #
-# The encodings are confirmed correct: they match Yahboom's own construction
-# byte for byte, and their sample notebook drives the arm through exactly these
-# two calls. So the remaining suspects are physical - the arm not wired to the
-# expansion board's arm connector, a separate servo rail unpowered, or this
-# being a Jettank whose arm differs from the Transbot the library targets.
-# Three bus servos on their own protocol, entirely separate from the PWM
-# servos that aim the camera. Pulse values run 900-3100 and each joint has a
-# different usable angle range, so the conversions below are Yahboom's own -
-# guessing these would drive a joint into its end stop, which stalls the servo
-# and cooks it.
+#   PWM 1, 2     camera pan / tilt          (working, verified from frames)
+#   PWM 3-8      nothing
+#   BUS 10       AN ARM JOINT               peak disturbance 4001 vs baseline
+#                                           78 - a 50x signal, unambiguous
+#   BUS 1-9, 11-40   nothing
+#
+# So exactly one arm actuator answers. The Transbot library documents ids
+# 7/8/9 and Yahboom's arm docs describe joints on PWM 3/4 with a separate
+# jaws servo; neither matches this robot. A JetTank ROS snippet addresses the
+# gripper as ArmJoint id 6, but bus id 6 does not respond - that id is
+# logical, translated by their driver, not a bus address.
+#
+# The remaining joints and the gripper are therefore not reachable over this
+# bus. Most likely they are unpowered or not connected - the arm's servos
+# daisy-chain, and only the one nearest the connector answering would look
+# exactly like this.
+ARM_SERVO_JOINT = 10          # the one confirmed actuator
+ARM_JOINT_PULSE = (1400, 2600)   # safe travel; +/-1000 rocked the chassis
+
 ARM_JOINTS = (7, 8, 9)
 ARM_RANGE = {7: (0, 225), 8: (30, 270), 9: (30, 180)}
 PULSE_MIN, PULSE_MAX = 900, 3100
