@@ -82,7 +82,7 @@ class GStreamerCamera:
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 
-def auto_expose(device: str, target: int = 115, tries: int = 8) -> dict:
+def auto_expose(device: str, target: int = 115, tries: int = 8, camera=None) -> dict:
     """Set gain and exposure so frames are actually usable.
 
     This matters more than it sounds. The camera ships with gain at 0 and
@@ -115,8 +115,14 @@ def auto_expose(device: str, target: int = 115, tries: int = 8) -> dict:
         log.debug("numpy/PIL unavailable - leaving camera exposure alone")
         return {}
 
-    cam = build_camera(device, 640, 480, 30)
-    cam.start()
+    # Use the caller's camera when there is one. A v4l2 device cannot be
+    # opened twice, so creating our own here stole the loop's camera and left
+    # it falling back to the slow per-frame backend - which is exactly the
+    # bottleneck the streaming backend existed to remove.
+    owned = camera is None
+    cam = camera or build_camera(device, 640, 480, 30)
+    if owned:
+        cam.start()
     time.sleep(1.2)
     exposure, gain, measured = 2500, 100, 0.0
     try:
@@ -158,7 +164,8 @@ def auto_expose(device: str, target: int = 115, tries: int = 8) -> dict:
     except Exception as exc:  # noqa: BLE001 - never block startup on this
         log.warning("auto-exposure failed (%s)", exc)
     finally:
-        cam.stop()
+        if owned:
+            cam.stop()
     log.info("camera exposure set: exposure=%d gain=%d (mean %.0f/255)",
              exposure, gain, measured)
     return {"exposure": exposure, "gain": gain, "mean": round(measured)}

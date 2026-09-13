@@ -676,9 +676,10 @@ class Loop:
             # Before anything looks at a frame: the camera defaults to gain 0
             # and in a dim room produces near-black images that defeat both the
             # detector and the vision model.
-            if self.cfg.camera.auto_expose:
-                await asyncio.to_thread(auto_expose, self.cfg.camera.device)
             self.camera.start()
+            if self.cfg.camera.auto_expose:
+                await asyncio.to_thread(auto_expose, self.cfg.camera.device,
+                                        camera=self.camera)
         ok = await self.vlm.available()
         if not ok:
             log.error(
