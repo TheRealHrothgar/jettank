@@ -400,10 +400,26 @@ class RosmasterDriver:
     # interface is built around the one joint that exists rather than pretending
     # to be a three-axis arm. Positions are named because raw pulse values are
     # meaningless to anyone using this, including the model.
-    # The jaws are MECHANICALLY LINKED to this joint - there is no separate
-    # gripper servo, and the linkage closes the claw as the arm folds down and
-    # opens it as the arm folds up. So arm angle and grip are one degree of
-    # freedom, not two, and the pose names reflect both meanings.
+    # Arm angle and grip move together. TWO explanations fit, and which one is
+    # true has not been established:
+    #
+    #   a) a mechanical linkage - one servo, the claw driven off the arm angle
+    #   b) an ID COLLISION - all three arm servos set to the same id, so one
+    #      command moves all of them at once
+    #
+    # (b) comes from Yahboom's own warning on set_uart_servo_id: "confirm that
+    # only one bus actuator is connected. Otherwise, all connected bus actuators
+    # will be set to the same ID." If that was ever run with the whole arm
+    # attached, every servo would now answer to id 10 - which looks exactly
+    # like a linkage from outside. Broadcast id 254 and id 10 produce near
+    # identical motion (4393 vs 4203 peak), consistent with either.
+    #
+    # Distinguishing them needs the arm disconnected and each servo attached
+    # alone. If (b) holds, re-IDing them to 7/8/9 one at a time gives a real
+    # three-axis arm AND an independent gripper. Worth doing before accepting
+    # this robot has one degree of freedom.
+    #
+    # Either way the behaviour below is correct as observed, so it stands.
     ARM_POSES = {
         "stow": 2600,       # folded back, out of camera view - jaws CLOSED
         "down": 2300,       # jaws closing
