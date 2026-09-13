@@ -66,6 +66,7 @@ FUNC_AUTO_REPORT = 0x08
 FUNC_MOTOR = 0x09             # (index 1-2, int16 speed -100..100)
 FUNC_CAR_RUN = 0x0D
 FUNC_UART_SERVO = 0x20        # the arm's bus servos
+FUNC_UART_SERVO_TORQUE = 0x22
 FUNC_ARM_CTRL = 0x23
 FUNC_VERSION = 0x51
 
@@ -131,6 +132,53 @@ def beep_frame(ms: int) -> bytes:
 def servo_frame(servo_id: int, angle: int) -> bytes:
     return encode(FUNC_PWM_SERVO,
                   bytes((max(1, min(int(servo_id), 4)), max(0, min(int(angle), 180)))))
+
+
+# --- the arm -------------------------------------------------------------
+# Three bus servos on their own protocol, entirely separate from the PWM
+# servos that aim the camera. Pulse values run 900-3100 and each joint has a
+# different usable angle range, so the conversions below are Yahboom's own -
+# guessing these would drive a joint into its end stop, which stalls the servo
+# and cooks it.
+ARM_JOINTS = (7, 8, 9)
+ARM_RANGE = {7: (0, 225), 8: (30, 270), 9: (30, 180)}
+PULSE_MIN, PULSE_MAX = 900, 3100
+
+
+def arm_angle_to_pulse(servo_id: int, angle: float, offset: float = 0.0) -> int:
+    """Yahboom's per-joint angle -> pulse mapping, reproduced exactly.
+
+    Each joint is mapped differently and two of the three are inverted; this
+    is not a formula to rederive from first principles.
+    """
+    span = PULSE_MAX - PULSE_MIN
+    if servo_id == 7:
+        value = span * (angle - offset - 180) / (0 - 180) + PULSE_MIN
+    elif servo_id == 8:
+        value = span * (angle - 90 - offset - 180) / (0 - 180) + PULSE_MIN
+    elif servo_id == 9:
+        value = span * (angle + offset - 0) / (180 - 0) + PULSE_MIN
+    else:
+        raise ValueError(f"servo {servo_id} is not an arm joint")
+    return int(max(PULSE_MIN, min(PULSE_MAX, value)))
+
+
+def arm_frame(servo_id: int, pulse: int, run_time_ms: int = 500) -> bytes:
+    """Move one bus servo to a pulse value over run_time_ms."""
+    pulse = max(PULSE_MIN, min(PULSE_MAX, int(pulse)))
+    run = max(0, min(int(run_time_ms), 2000))
+    return encode(FUNC_UART_SERVO,
+                  bytes((int(servo_id) & 0xFF,)) + struct.pack("<h", pulse)
+                  + struct.pack("<h", run))
+
+
+def arm_torque_frame(on: bool) -> bytes:
+    """Enable or release holding torque on the arm servos.
+
+    Releasing lets the arm be posed by hand, and is the safe state to leave it
+    in - a servo holding a stalled position draws current and heats up.
+    """
+    return encode(FUNC_UART_SERVO_TORQUE, bytes((1 if on else 0,)))
 
 
 def headlight_frame(brightness: int) -> bytes:
@@ -213,6 +261,7 @@ class RosmasterDriver:
         self.pan = 0.0
         self.tilt = 0.0
         self.light = 0
+        self.arm_angles: dict[int, float] = {}
         self._pan_sign = 1 if self._v.get("pan_sign", 1) >= 0 else -1
         self._tilt_sign = 1 if self._v.get("tilt_sign", 1) >= 0 else -1
 
@@ -273,11 +322,55 @@ class RosmasterDriver:
         self._link.send(servo_frame(tilt_id, int(90 - t * self._tilt_sign)))
         self.pan, self.tilt = p, t
 
-    def arm(self, joint: str, angle: float) -> None:
-        log.warning("[arm] the arm's protocol is not verified - not transmitting")
+    # ---- arm ----
+    def arm(self, joint: str | int, angle: float, run_time_ms: int = 600) -> None:
+        """Move one arm joint. `joint` is a servo id (7, 8, 9) or a mapped name.
+
+        Gated like the motors: an unverified arm is not moved, because driving
+        a bus servo past its end stop stalls it against its own gearbox.
+        """
+        if not self.confirmed("arm"):
+            log.warning("[arm] arm not verified - not transmitting "
+                        "(run tools/verify_arm.py)")
+            return
+        sid = self._joint_id(joint)
+        if sid is None:
+            log.error("[arm] unknown joint %r; known: %s", joint, self.joint_names())
+            return
+        lo, hi = ARM_RANGE[sid]
+        clamped = max(lo, min(hi, float(angle)))
+        if clamped != angle:
+            log.info("[arm] joint %s angle %.0f clamped to %.0f (range %d-%d)",
+                     joint, angle, clamped, lo, hi)
+        offset = float(self._v.get(f"arm_offset_{sid}", 0.0))
+        self._link.send(arm_frame(sid, arm_angle_to_pulse(sid, clamped, offset),
+                                  run_time_ms))
+        self.arm_angles[sid] = clamped
+
+    def _joint_id(self, joint) -> int | None:
+        if isinstance(joint, int):
+            return joint if joint in ARM_JOINTS else None
+        names = self._v.get("arm_names", {})
+        for sid, name in names.items():
+            if str(name).lower() == str(joint).lower():
+                return int(sid)
+        return None
+
+    def joint_names(self) -> list[str]:
+        return sorted(str(n) for n in self._v.get("arm_names", {}).values()) or \
+            [str(j) for j in ARM_JOINTS]
 
     def gripper(self, closed: bool) -> None:
-        log.warning("[gripper] not verified - not transmitting")
+        sid = self._joint_id("gripper")
+        if sid is None:
+            log.warning("[gripper] no joint mapped as the gripper yet")
+            return
+        lo, hi = ARM_RANGE[sid]
+        self.arm(sid, lo if closed else hi)
+
+    def arm_torque(self, on: bool) -> None:
+        """Hold position, or go limp so the arm can be posed by hand."""
+        self._link.send(arm_torque_frame(on))
 
     def headlights(self, brightness: int) -> None:
         """0 off, 100 full. Safe regardless of motor verification."""
