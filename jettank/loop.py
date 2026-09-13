@@ -616,6 +616,40 @@ class Loop:
                     except Exception as exc:  # noqa: BLE001
                         log.debug("mic reopen failed: %s", exc)
 
+    async def usb_watchdog_forever(self) -> None:
+        """Notice when the USB controller has died, and say so.
+
+        This board's xHCI controller wedges occasionally and takes the camera,
+        microphone and LIDAR with it in one go. From the outside that is
+        indistinguishable from someone unplugging the hub, which is exactly how
+        it was misdiagnosed more than once.
+
+        Hank cannot reset the controller himself - that needs root on a sysfs
+        path outside his reach - but he CAN notice, say so out loud, and stop
+        pretending to listen. A robot that announces "I have lost my ears" is
+        far better than one that silently ignores a child.
+        """
+        announced = False
+        while not self._stop.is_set():
+            await asyncio.sleep(20.0)
+            if self.static_image_b64:
+                continue
+            lost = (self.voice is not None
+                    and not _usb_capture_present()
+                    and not os.path.exists(self.cfg.camera.device))
+            if lost and not announced:
+                announced = True
+                log.error("[usb] every USB device is gone - the controller has "
+                          "probably died. Recover with deploy/usb-recover.sh")
+                if self.console:
+                    self.console.event(
+                        "err", "USB is gone - run deploy/usb-recover.sh on the robot")
+                self.say("I have lost my ears and my eyes. Someone needs to help me.")
+            elif not lost and announced:
+                announced = False
+                log.info("[usb] devices are back")
+                self.say("I can see and hear again.")
+
     async def battery_forever(self) -> None:
         """Watch the pack and act before a brown-out corrupts the disk.
 
@@ -759,6 +793,7 @@ class Loop:
             asyncio.create_task(self.status_forever()),
             asyncio.create_task(self.watch_forever()),
             asyncio.create_task(self.battery_forever()),
+            asyncio.create_task(self.usb_watchdog_forever()),
             asyncio.create_task(self.peripherals_forever()),
         ]
         if self.voice is not None:
