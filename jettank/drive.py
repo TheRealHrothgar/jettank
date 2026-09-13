@@ -66,6 +66,7 @@ FUNC_AUTO_REPORT = 0x08
 FUNC_MOTOR = 0x09             # (index 1-2, int16 speed -100..100)
 FUNC_CAR_RUN = 0x0D
 FUNC_UART_SERVO = 0x20        # the arm's bus servos
+FUNC_UART_SERVO_ID = 0x21     # query: reply comes back as a 0x20 report
 FUNC_UART_SERVO_TORQUE = 0x22
 FUNC_ARM_CTRL = 0x23
 FUNC_VERSION = 0x51
@@ -135,6 +136,23 @@ def servo_frame(servo_id: int, angle: int) -> bytes:
 
 
 # --- the arm -------------------------------------------------------------
+# STATUS: implemented and byte-exact against Yahboom's library, but NOT yet
+# observed to move anything on this robot. Everything below has been tried with
+# the servo board powered:
+#
+#   PWM servo ids 1-8 (0x03)      only 1 and 2 respond - the camera pan/tilt
+#   bus servo ids 7,8,9 (0x20)    no movement
+#   all three at once (0x23)      no movement
+#   torque enable (0x22)          no observable effect
+#   position query (0x21)         no reply - but this firmware answers NO
+#                                 query, not even FUNC_VERSION, so that tells
+#                                 us nothing either way
+#
+# The encodings are confirmed correct: they match Yahboom's own construction
+# byte for byte, and their sample notebook drives the arm through exactly these
+# two calls. So the remaining suspects are physical - the arm not wired to the
+# expansion board's arm connector, a separate servo rail unpowered, or this
+# being a Jettank whose arm differs from the Transbot the library targets.
 # Three bus servos on their own protocol, entirely separate from the PWM
 # servos that aim the camera. Pulse values run 900-3100 and each joint has a
 # different usable angle range, so the conversions below are Yahboom's own -
@@ -170,6 +188,36 @@ def arm_frame(servo_id: int, pulse: int, run_time_ms: int = 500) -> bytes:
     return encode(FUNC_UART_SERVO,
                   bytes((int(servo_id) & 0xFF,)) + struct.pack("<h", pulse)
                   + struct.pack("<h", run))
+
+
+def arm_query_frame(servo_id: int) -> bytes:
+    """Ask a bus servo for its position.
+
+    The reply arrives asynchronously on the telemetry stream as a 0x20 frame
+    carrying [id, int16 position]. Useful for finding which servos physically
+    exist: an id that answers is present, one that does not is not wired.
+    """
+    return encode(FUNC_UART_SERVO_ID, bytes((int(servo_id) & 0xFF,)))
+
+
+def arm_all_frame(angle7: float, angle8: float, angle9: float,
+                  run_time_ms: int = 700, offsets=(0.0, 0.0, 0.0)) -> bytes:
+    """All three joints in one frame (FUNC_ARM_CTRL).
+
+    Distinct from sending three separate bus-servo commands: this is the call
+    Yahboom's own arm control uses, and on some firmware it is the only one
+    the arm responds to. Angles are clamped to each joint's documented range
+    before conversion - a bus servo driven past its end stop stalls against
+    its own gearbox.
+    """
+    a7 = max(ARM_RANGE[7][0], min(ARM_RANGE[7][1], float(angle7)))
+    a8 = max(ARM_RANGE[8][0], min(ARM_RANGE[8][1], float(angle8)))
+    a9 = max(ARM_RANGE[9][0], min(ARM_RANGE[9][1], float(angle9)))
+    payload = (struct.pack("<h", arm_angle_to_pulse(7, a7, offsets[0]))
+               + struct.pack("<h", arm_angle_to_pulse(8, a8, offsets[1]))
+               + struct.pack("<h", arm_angle_to_pulse(9, a9, offsets[2]))
+               + struct.pack("<h", max(0, min(int(run_time_ms), 2000))))
+    return encode(FUNC_ARM_CTRL, payload)
 
 
 def arm_torque_frame(on: bool) -> bytes:
