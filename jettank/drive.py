@@ -158,6 +158,28 @@ def servo_frame(servo_id: int, angle: int) -> bytes:
 # bus. Most likely they are unpowered or not connected - the arm's servos
 # daisy-chain, and only the one nearest the connector answering would look
 # exactly like this.
+# THE GRIPPER DOES NOT RESPOND, and this was established with the jaws in
+# direct view of the camera rather than by asking someone to watch.
+#
+# Method: raise the arm on servo 10 so the gripper faces the camera, then
+# sweep every id while diffing only the pixels the jaws occupy. Noise floor
+# 2.58; the only signal above it was BUS 10 at 28.07 - and that is the arm
+# swinging the whole assembly through frame, not the jaws moving.
+#
+#   BUS 1-12   only 10 registers, and only as arm motion
+#   PWM 3-12   nothing
+#
+# Caelan spotted why it LOOKED like the claw was working: the jaws appear to
+# open when the arm tilts up and close when it tilts down. Holding servo 10
+# fixed and moving only the camera showed the jaws unchanged - so that was the
+# arm changing the viewing angle, not actuation. A good catch; it would have
+# been easy to record a working gripper on the strength of it.
+#
+# Yahboom's gamepad mapping (R1 close, R2 open) and their ROS ArmJoint id 6
+# both exist, so the hardware works under their stack. Those ids are logical,
+# translated by their driver; bus id 6 is silent. The likeliest explanation
+# remains that the arm's servos daisy-chain and only the one nearest the
+# connector is powered or attached.
 ARM_SERVO_JOINT = 10          # the one confirmed actuator
 ARM_JOINT_PULSE = (1400, 2600)   # safe travel; +/-1000 rocked the chassis
 
