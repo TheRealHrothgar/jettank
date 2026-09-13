@@ -10,6 +10,7 @@ import contextlib
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -268,7 +269,11 @@ class StreamingCamera:
             self._thread.join(timeout=1.0)
         if self._proc is not None:
             with contextlib.suppress(Exception):
-                self._proc.terminate()
+                # SIGINT, not SIGTERM: GStreamer treats interrupt as "send EOS
+                # and shut down cleanly", which releases the v4l2 device and
+                # its USB endpoints in order. SIGTERM is more abrupt and is
+                # what the controller objects to.
+                self._proc.send_signal(signal.SIGINT)
                 try:
                     self._proc.wait(timeout=4)
                 except subprocess.TimeoutExpired:

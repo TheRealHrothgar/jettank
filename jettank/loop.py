@@ -46,14 +46,19 @@ log = logging.getLogger("jettank")
 
 
 def _usb_capture_present() -> bool:
-    """Is there a USB capture device at all? Cheap check before reopening."""
+    """Is a USB audio card registered? A FILE READ, not a device enumeration.
+
+    This used to shell out to `arecord -l`, which opens and enumerates ALSA
+    devices. On a 5 second timer that is ~720 enumerations an hour against the
+    same USB audio device arecord is actively streaming from - and this board's
+    xHCI controller does not survive that kind of poking indefinitely.
+
+    /proc/asound/cards is kernel state. Reading it touches no hardware.
+    """
     try:
-        out = subprocess.run(["arecord", "-l"], capture_output=True, text=True,
-                             timeout=5).stdout
-    except Exception:  # noqa: BLE001
+        return "USB-Audio" in Path("/proc/asound/cards").read_text()
+    except OSError:
         return False
-    return any(line.startswith("card ") and "APE" not in line and "HDA" not in line
-               for line in out.splitlines())
 
 # Varied so it does not become wallpaper - the same sentence every time stops
 # being heard after a day.
@@ -552,34 +557,27 @@ class Loop:
         while not self._stop.is_set():
             await asyncio.sleep(5.0)
 
-            # Camera. Restarting this is NOT free: tearing down a streaming
-            # USB pipeline issues a stop-endpoint command, and doing that
-            # mid-transfer wedged the xHCI controller hard enough to kill every
-            # USB device on the robot - camera, microphone and LIDAR at once.
-            # Observed twice, about a minute after startup each time.
+            # The camera is deliberately NOT restarted here any more.
             #
-            # So a restart now needs sustained failure, not one bad frame, and
-            # there is a cooldown between attempts. A momentarily short frame
-            # is normal; a camera that has genuinely gone needs the device node
-            # to have vanished too, and that case is handled by simply waiting
-            # for it to come back rather than by forcing anything.
+            # Tearing down a streaming USB endpoint is the exact operation in
+            # the "xHCI host not responding to stop endpoint command" that
+            # precedes the controller dying, and across every occurrence the
+            # restart never once recovered a camera that had genuinely gone.
+            # It only ever added risk. If the device node disappears the camera
+            # is gone for hardware reasons and no amount of reopening helps; if
+            # it is present, the existing pipeline is already fine.
+            #
+            # Reduced to observation, which costs nothing.
             if not self.static_image_b64:
                 _, img = self.camera.latest_jpeg_b64()
                 if img and len(img) > 1024:
                     self._bad_frames = 0
                 else:
                     self._bad_frames += 1
-                    device_there = os.path.exists(self.cfg.camera.device)
-                    cooled = time.monotonic() - self._last_cam_restart > 60.0
-                    if self._bad_frames >= 6 and device_there and cooled:
-                        log.info("[peripherals] camera has produced nothing for "
-                                 "%d checks - reopening", self._bad_frames)
-                        self._last_cam_restart = time.monotonic()
-                        self._bad_frames = 0
-                        try:
-                            self._restart_camera()
-                        except Exception as exc:  # noqa: BLE001
-                            log.debug("camera reopen failed: %s", exc)
+                    if self._bad_frames == 12:
+                        log.warning("[peripherals] no usable frame for a minute; "
+                                    "camera device present=%s",
+                                    os.path.exists(self.cfg.camera.device))
 
             # Microphone: arecord exits when its device disappears.
             v = self.voice
@@ -615,40 +613,6 @@ class Loop:
                             self.console.event("agent", "microphone back")
                     except Exception as exc:  # noqa: BLE001
                         log.debug("mic reopen failed: %s", exc)
-
-    async def usb_watchdog_forever(self) -> None:
-        """Notice when the USB controller has died, and say so.
-
-        This board's xHCI controller wedges occasionally and takes the camera,
-        microphone and LIDAR with it in one go. From the outside that is
-        indistinguishable from someone unplugging the hub, which is exactly how
-        it was misdiagnosed more than once.
-
-        Hank cannot reset the controller himself - that needs root on a sysfs
-        path outside his reach - but he CAN notice, say so out loud, and stop
-        pretending to listen. A robot that announces "I have lost my ears" is
-        far better than one that silently ignores a child.
-        """
-        announced = False
-        while not self._stop.is_set():
-            await asyncio.sleep(20.0)
-            if self.static_image_b64:
-                continue
-            lost = (self.voice is not None
-                    and not _usb_capture_present()
-                    and not os.path.exists(self.cfg.camera.device))
-            if lost and not announced:
-                announced = True
-                log.error("[usb] every USB device is gone - the controller has "
-                          "probably died. Recover with deploy/usb-recover.sh")
-                if self.console:
-                    self.console.event(
-                        "err", "USB is gone - run deploy/usb-recover.sh on the robot")
-                self.say("I have lost my ears and my eyes. Someone needs to help me.")
-            elif not lost and announced:
-                announced = False
-                log.info("[usb] devices are back")
-                self.say("I can see and hear again.")
 
     async def battery_forever(self) -> None:
         """Watch the pack and act before a brown-out corrupts the disk.
@@ -793,7 +757,6 @@ class Loop:
             asyncio.create_task(self.status_forever()),
             asyncio.create_task(self.watch_forever()),
             asyncio.create_task(self.battery_forever()),
-            asyncio.create_task(self.usb_watchdog_forever()),
             asyncio.create_task(self.peripherals_forever()),
         ]
         if self.voice is not None:

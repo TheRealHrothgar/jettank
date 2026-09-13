@@ -32,6 +32,18 @@ EnvironmentFile=/home/jetson/.jettank.env
 
 ExecStart=/home/jetson/jettank/.venv/bin/python3 -m jettank.loop
 
+# ONLY signal the main process. The default, control-group, SIGTERMs every
+# child directly and in parallel - including gst-launch and arecord, which hold
+# streaming USB endpoints. Killing those abruptly and simultaneously is what
+# produced "xHCI host not responding to stop endpoint command" followed by the
+# controller dying and taking the camera, microphone and LIDAR with it. Every
+# one of those deaths clustered around a service restart.
+#
+# With mixed, Python gets the signal, shuts the camera and audio down in order,
+# and systemd only escalates if that genuinely hangs.
+KillMode=mixed
+TimeoutStopSec=25
+
 Restart=always
 RestartSec=10
 # The voice kill word exits with this code. Without this line systemd would
