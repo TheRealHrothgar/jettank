@@ -673,13 +673,22 @@ class Loop:
 
     async def run(self) -> None:
         if not self.static_image_b64:
-            # Before anything looks at a frame: the camera defaults to gain 0
-            # and in a dim room produces near-black images that defeat both the
-            # detector and the vision model.
-            self.camera.start()
-            if self.cfg.camera.auto_expose:
-                await asyncio.to_thread(auto_expose, self.cfg.camera.device,
-                                        camera=self.camera)
+            # A missing camera must not stop him booting. He still hears,
+            # speaks, reads his sensors and refuses to move - which is a
+            # useful robot - and the peripheral supervisor reconnects the
+            # camera on its own when it reappears. Crash-looping instead
+            # means an unplugged USB lead takes the whole robot down.
+            try:
+                self.camera.start()
+                # Before anything looks at a frame: the camera defaults to
+                # gain 0 and in a dim room produces near-black images that
+                # defeat both the detector and the vision model.
+                if self.cfg.camera.auto_expose:
+                    await asyncio.to_thread(auto_expose, self.cfg.camera.device,
+                                            camera=self.camera)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("starting without a camera (%s) - will reconnect "
+                            "when one appears", exc)
         ok = await self.vlm.available()
         if not ok:
             log.error(
