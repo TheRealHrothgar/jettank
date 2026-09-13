@@ -329,9 +329,17 @@ class AgentSession:
 
     @property
     def system_prompt(self) -> str:
-        if not self._system_facts:
-            return AGENT_SYSTEM_PROMPT
-        return f"{AGENT_SYSTEM_PROMPT}\n\n{self._system_facts}"
+        from .audience import KIDS, KIDS_STYLE
+
+        parts = [AGENT_SYSTEM_PROMPT]
+        if self._system_facts:
+            parts.append(self._system_facts)
+        # Style goes LAST so it takes precedence over anything above it - the
+        # capability description is written for an engineer, and how to speak
+        # to a six-year-old has to win.
+        if KIDS:
+            parts.append(KIDS_STYLE)
+        return "\n\n".join(parts)
 
     @property
     def in_conversation(self) -> bool:

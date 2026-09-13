@@ -560,6 +560,9 @@ class ToolBox:
         board = getattr(self._loop, "board", None)
         if board is not None:
             st.update(board.status())
+        budget = getattr(self._loop, "budget", None)
+        if budget is not None:
+            st.update(budget.status())
         batt = getattr(self._loop, "battery", None)
         if batt is not None and batt.voltage is not None:
             st["battery_state"] = batt.state

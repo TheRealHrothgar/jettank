@@ -62,11 +62,24 @@ KILL_PHRASES = _phrases(
 # Disarming is not symmetric with arming and is not meant to be. Anything may
 # disarm - a tool call, the console, a control word - because stopping is
 # always the safe direction. Only starting needs a human.
-ARM_PHRASES = _phrases(
-    "JETTANK_ARM_WORDS",
-    "hank arm motion,hank enable motion,arm motion hank,enable motion hank,"
-    "hank you may move,hank permission to move,hank motion on",
-)
+def _arm_defaults() -> str:
+    """Arming phrases, harder in kids mode.
+
+    "Hank arm motion" is easy for a child to repeat after hearing it once, and
+    arming the motors is the one spoken control with real consequences. In kids
+    mode the phrase needs words they are unlikely to produce by accident, so
+    arming stays an adult act even when children are operating the robot.
+    """
+    from .audience import KIDS, KIDS_ARM_PHRASES
+
+    if KIDS:
+        return ",".join(KIDS_ARM_PHRASES)
+    return ("hank arm motion,hank enable motion,arm motion hank,"
+            "enable motion hank,hank you may move,hank permission to move,"
+            "hank motion on")
+
+
+ARM_PHRASES = _phrases("JETTANK_ARM_WORDS", _arm_defaults())
 DISARM_PHRASES = _phrases(
     "JETTANK_DISARM_WORDS",
     "hank disarm,hank disarm motion,hank disable motion,disarm hank,"

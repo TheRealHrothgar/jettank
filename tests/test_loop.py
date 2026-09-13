@@ -558,8 +558,18 @@ check("the service would otherwise restart", "Restart=always" in unit)
 print("\nArming (human-only, asymmetric by design)")
 from jettank.control import ARM_PHRASES, DISARM_PHRASES  # noqa: E402
 
-check("arm phrases are recognised", classify("Hank arm motion") == "arm")
-check("enable motion is recognised", classify("hank enable motion") == "arm")
+# The arming phrase differs by audience: in kids mode it needs words a child
+# will not say by accident, because arming the motors is the one spoken
+# control with real consequences and "Hank arm motion" is easy to repeat.
+from jettank.audience import KIDS  # noqa: E402
+
+_arm_example = ARM_PHRASES[0]
+check("an arm phrase is recognised", classify(_arm_example) == "arm", _arm_example)
+check("in kids mode the easy phrase does NOT arm",
+      (classify("Hank arm motion") is None) if KIDS
+      else (classify("Hank arm motion") == "arm"),
+      f"KIDS={KIDS}")
+check("arming always needs his name", all("hank" in p for p in ARM_PHRASES))
 check("disarm is recognised", classify("Hank, disarm.") == "disarm")
 check("motion off is recognised", classify("hank motion off") == "disarm")
 check("stay still disarms", classify("hank stay still") == "disarm")
@@ -689,7 +699,66 @@ check("NoNewPrivileges does not block the battery shutdown",
 check("the network is wanted, never required",
       "Requires=network" not in unit and "Wants=network-online" not in unit)
 
-# ---------- live reload ----------
+# ---------- built for 1st/2nd graders ----------
+print("\nAudience (children, 6-8)")
+from jettank.audience import (KIDS, KIDS_ARM_PHRASES, KIDS_STYLE,  # noqa: E402
+                              RESTING_PHRASES, Budget)
+
+check("kids mode is the default", KIDS is True)
+
+# The style rules are what make him usable by a child; assert the ones that
+# matter rather than the prose around them.
+style = KIDS_STYLE.lower()
+check("he is told to use short simple sentences",
+      "short sentences" in style and "simple" in style)
+check("he is told not to use jargon", "servo" in style and "firmware" in style)
+check("he is told to be kind when he mishears",
+      "say it again" in style or "didn't catch" in style)
+check("he is told to refuse unsafe requests", "unsafe" in style or "risky" in style)
+check("he is told never to frighten them",
+      "frightening" in style or "never say anything" in style)
+check("he is told to say what he CAN do instead", "instead" in style)
+
+# Arming is the one spoken control with real consequences, and a child can
+# repeat "Hank arm motion" after hearing it once.
+check("kids arming phrases are long enough to be deliberate",
+      all(len(p.split()) >= 4 for p in KIDS_ARM_PHRASES), str(KIDS_ARM_PHRASES))
+check("kids arming still requires his name",
+      all("hank" in p for p in KIDS_ARM_PHRASES))
+check("the easy adult phrase does not arm in kids mode",
+      classify("hank arm motion") is None)
+# ...but stopping must stay as easy as possible, for anyone.
+check("stopping stays a short phrase", classify("hank halt") == "stop")
+check("disarming stays easy", classify("hank disarm") == "disarm")
+
+# A child will talk to a robot for an hour; every utterance is a cloud call.
+b = Budget(per_hour=3)
+check("budget starts allowing", b.allow() is True)
+for _ in range(3):
+    b.record()
+check("budget stops at the cap", b.allow() is False)
+check("budget reports what is left", b.remaining() == 0)
+check("budget appears in status", "cloud_budget_remaining_this_hour" in b.status())
+check("a zero budget means unlimited", Budget(per_hour=0).allow() is True)
+check("unlimited says so", Budget(per_hour=0).status()["cloud_budget"] == "unlimited")
+
+# Running out must not look like being broken.
+check("there is something to say when the budget runs out", len(RESTING_PHRASES) >= 3)
+check("those phrases invite trying again",
+      all(("again" in p.lower() or "minute" in p.lower()) for p in RESTING_PHRASES))
+
+# The console a child sees must not offer the controls that matter.
+from jettank.console import KIDS_PAGE, PAGE  # noqa: E402
+
+check("kids page has a big stop button", "class=stop" in KIDS_PAGE and "STOP" in KIDS_PAGE)
+check("kids page offers plain-language actions",
+      "What do you see?" in KIDS_PAGE and "Look left" in KIDS_PAGE)
+check("kids page has no arming button", "arm motion" not in KIDS_PAGE)
+check("kids page avoids jargon",
+      not any(w in KIDS_PAGE for w in ("E-STOP", "reload code", "disarm motion")))
+check("the engineering console still exists", "E-STOP" in PAGE)
+
+
 print("\nLive reload (apply edits without a restart)")
 from jettank.control import RELOAD_PHRASES  # noqa: E402
 from jettank.live import RELOADABLE_MODULES, Reloader  # noqa: E402

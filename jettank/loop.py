@@ -22,6 +22,7 @@ import time
 from collections import deque
 
 from . import config as cfg_mod
+from .audience import RESTING_PHRASES, Budget
 from .audio import Transcriber, VoiceListener, match_wake_word
 from .board import BoardReader
 from .camera import auto_expose, build_camera
@@ -155,15 +156,13 @@ class Loop:
         self._awake = False
         self._work: asyncio.Task | None = None
         self._killed = False
-        self.reloader = Reloader(self)
-        self._bad_frames = 0
-        self._last_cam_restart = 0.0
-        self.battery = BatteryMonitor(self)
         self._arm_requested = 0.0
         self.reloader = Reloader(self)
+        self.battery = BatteryMonitor(self)
+        self.budget = Budget()
+        # Camera health tracking for the peripheral supervisor.
         self._bad_frames = 0
         self._last_cam_restart = 0.0
-        self.battery = BatteryMonitor(self)
 
         self.transcript: deque[dict] = deque(maxlen=32)
         self.observations: deque[str] = deque(maxlen=32)
@@ -328,6 +327,14 @@ class Loop:
             if frame is None and not self.static_image_b64:
                 _, frame = self.camera.latest_jpeg_b64()
             frame = frame or self.static_image_b64
+        if not self.budget.allow():
+            # Keep listening and keep talking - going silent reads as broken,
+            # especially to a child who will just try again louder.
+            msg = random.choice(RESTING_PHRASES)
+            log.info("[budget] cloud budget spent; declining politely")
+            self.say(msg)
+            return {"ok": False, "error": "cloud budget spent", "reply": msg}
+        self.budget.record()
         result = await self.agent.run(text, image_b64=frame, remember=remember)
         if not result.get("ok"):
             log.warning("[agent] %s", result.get("error", "failed"))

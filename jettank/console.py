@@ -70,6 +70,80 @@ setInterval(async()=>{const s=await (await fetch('/api/state')).json();
 """
 
 
+# A separate page for children rather than a reskin of the engineering one.
+# The adult console is dense, uses words like E-STOP and disarm, and puts
+# destructive controls next to harmless ones. A six-year-old needs big targets,
+# plain words, and no way to reach the controls that matter by mistake.
+KIDS_PAGE = """<!doctype html><meta charset=utf-8><title>Hank</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+ body{background:#101418;color:#eee;font:18px/1.5 system-ui,sans-serif;margin:0;padding:14px}
+ h1{font-size:26px;margin:0 0 10px;color:#7fd}
+ img{width:100%;max-width:560px;border-radius:12px;background:#000;display:block}
+ .row{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}
+ button{font:600 20px system-ui,sans-serif;padding:16px 20px;border-radius:14px;
+        border:none;background:#2b3a46;color:#fff;cursor:pointer;flex:1 1 150px;
+        min-height:64px}
+ button:active{transform:scale(.97)}
+ button.stop{background:#c0392b;flex:1 1 100%;font-size:30px;min-height:90px}
+ #say{width:100%;font:20px system-ui,sans-serif;padding:16px;border-radius:12px;
+      border:2px solid #456;background:#0a0d10;color:#fff;box-sizing:border-box}
+ #talk{background:#0a0d10;border:2px solid #234;border-radius:12px;padding:12px;
+       min-height:110px;margin-top:12px;font-size:19px}
+ .me{color:#8cf}.hank{color:#9f9}.oops{color:#f99}
+ #grown{margin-top:22px;font-size:14px;color:#678}
+ #grown button{font-size:14px;padding:8px 12px;min-height:0;background:#1b2228}
+</style>
+<h1>Hank</h1>
+<img id=cam src="/stream.mjpg" alt="what Hank sees">
+
+<div class=row><button class=stop onclick="go('interrupt','STOP')">STOP</button></div>
+
+<div class=row>
+  <button onclick="ask('What do you see?')">What do you see?</button>
+  <button onclick="ask('Look to your left and tell me what is there.')">Look left</button>
+  <button onclick="ask('Look to your right and tell me what is there.')">Look right</button>
+</div>
+<div class=row>
+  <button onclick="ask('Say hello and tell me your name.')">Say hello</button>
+  <button onclick="ask('Put your arm up.')">Arm up</button>
+  <button onclick="ask('Put your arm down and tuck it away.')">Arm down</button>
+</div>
+
+<form id=f><input id=say placeholder="Type something to Hank..." autocomplete=off></form>
+<div id=talk></div>
+
+<div id=grown>
+  Grown-ups:
+  <button onclick="go('disarm','wheels off')">wheels off</button>
+  <button onclick="go('estop','emergency stop')">emergency stop</button>
+  <span id=stat></span>
+</div>
+
+<script>
+const talk=document.getElementById('talk');
+function line(cls,txt){const d=document.createElement('div');d.className=cls;d.textContent=txt;
+  talk.appendChild(d);talk.scrollTop=talk.scrollHeight;
+  while(talk.childNodes.length>12)talk.removeChild(talk.firstChild);}
+async function ask(t){
+  line('me','You: '+t);
+  line('hank','Hank is thinking...');
+  const r=await fetch('/api/command',{method:'POST',body:JSON.stringify({text:t})});
+  const j=await r.json();
+  talk.removeChild(talk.lastChild);
+  line(j.ok?'hank':'oops','Hank: '+(j.reply||j.error||"I didn't catch that."));
+}
+async function go(a,label){const r=await fetch('/api/'+a,{method:'POST'});
+  line('oops',label+': '+(await r.text()));}
+document.getElementById('f').onsubmit=e=>{e.preventDefault();
+  const i=document.getElementById('say'),t=i.value.trim();if(!t)return;i.value='';ask(t);};
+setInterval(async()=>{try{const s=await (await fetch('/api/state')).json();
+  document.getElementById('stat').textContent=
+    ' | wheels '+s.motion+' | '+s.estop;}catch(e){}},3000);
+</script>
+"""
+
+
 class Console:
     def __init__(self, loop, host: str = "0.0.0.0", port: int = 8080) -> None:
         self._loop = loop
@@ -184,6 +258,13 @@ def _make_handler(console: "Console"):
 
         def do_GET(self) -> None:
             if self.path in ("/", "/index.html"):
+                # Children get the simple page by default; the engineering
+                # console is still there at /pro for whoever needs it.
+                from .audience import KIDS
+
+                page = KIDS_PAGE if KIDS else PAGE
+                return self._send(200, page.encode(), "text/html; charset=utf-8")
+            if self.path in ("/pro", "/pro.html"):
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             if self.path == "/api/state":
                 return self._send(200, json.dumps(console._snapshot()).encode(),
